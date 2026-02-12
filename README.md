@@ -1,4 +1,4 @@
-# 10-K Financial Analyzer
+# 10-K Financial Analyser
 
 A web app that fetches the latest 10-K from SEC EDGAR for a given stock ticker (e.g. AAPL), then uses **Item 7 (MD&A)** and **Item 8 (Financial Statements)** to produce a CFA-style analysis: a detailed summary (financial health, profitability, key risks), a **CFA Investment Report** section, and key metrics (Revenue, Net Income, Operating Cash Flow). Powered by **Google Gemini**.
 
