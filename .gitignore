@@ -1,0 +1,20 @@
+venv/
+.env
+__pycache__/
+.DS_Store
+
+# Streamlit
+.streamlit/
+
+# Python
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
