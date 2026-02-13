@@ -57,22 +57,71 @@ def extract_text_from_file(file_path: Path) -> str:
     return ""
 
 
+# ---------- Selective Section Extraction (pre-filter: only Item 7 & 8, no PART I / ITEM 1–6) ----------
+ITEM7_PATTERNS = [
+    r"Item\s+7\s*[.:]\s*Management['\u2019]s\s+Discussion\s+and\s+Analysis",
+    r"ITEM\s+7\s*[.:]\s*Management['\u2019]s\s+Discussion",
+    r"Item\s+7\s*[.:]\s*[\w\s]+MD&A",
+]
+ITEM8_PATTERNS = [
+    r"Item\s+8\s*[.:]\s*Financial\s+Statements",
+    r"ITEM\s+8\s*[.:]\s*Financial\s+Statements",
+    r"Item\s+8\s*[.:]\s*[\w\s]+Consolidated\s+Financial",
+]
+
+
+def _find_section_start(text: str, patterns: list, item_num: int) -> int:
+    """Return start index of first matching pattern, or -1."""
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.start()
+    m = re.search(r"\bItem\s+" + str(item_num) + r"\b", text, re.IGNORECASE)
+    return m.start() if m else -1
+
+
+def prefilter_after_item7(full_text: str) -> str:
+    """Drop PART I, ITEM 1–6; keep only from Item 7 onward to reduce noise and token use."""
+    start = _find_section_start(full_text, ITEM7_PATTERNS, 7)
+    return full_text[start:] if start >= 0 else full_text
+
+
 def find_item_section(text: str, item_num: int, title_keywords: list) -> str:
-    """Find Item N section (e.g. item_num=7 -> Item 7, item_num=8 -> Item 8)."""
-    pattern = re.compile(
-        r"\bItem\s+" + str(item_num) + r"\b[.\s]*[^\n]*(" + "|".join(re.escape(k) for k in title_keywords) + r")?",
-        re.IGNORECASE,
-    )
-    match = pattern.search(text)
-    if not match:
-        return ""
-    start = match.start()
-    next_item = re.search(r"\n\s*Item\s+\d+\s+", text[start + 50 :], re.IGNORECASE)
+    """Extract only Item N section (regex-based). Used for Item 7 (MD&A) and Item 8 (Financial Statements)."""
+    patterns = ITEM7_PATTERNS if item_num == 7 else ITEM8_PATTERNS
+    start = _find_section_start(text, patterns, item_num)
+    if start == -1:
+        pattern = re.compile(
+            r"\bItem\s+" + str(item_num) + r"\b[.\s]*[^\n]*(" + "|".join(re.escape(k) for k in title_keywords) + r")?",
+            re.IGNORECASE,
+        )
+        match = pattern.search(text)
+        if not match:
+            return ""
+        start = match.start()
+    # End at next "Item N" (next major section)
+    next_item = re.search(r"\n\s*Item\s+\d+\s+", text[start + 100 :], re.IGNORECASE)
     if next_item:
-        end = start + 50 + next_item.start()
+        end = start + 100 + next_item.start()
     else:
-        end = min(start + 150000, len(text))  # Cap section size to stay within token limits
+        end = min(start + 150000, len(text))
     return text[start:end].strip()
+
+
+def smart_chunk(section: str, max_chars: int = 30000, head_ratio: float = 0.5) -> str:
+    """
+    If section exceeds max_chars, keep head and tail (quantitative data often at start/end).
+    Reduces tokens while preserving high-signal content.
+    """
+    if len(section) <= max_chars:
+        return section
+    head_size = int(max_chars * head_ratio)
+    tail_size = max_chars - head_size - 100  # reserve for separator
+    return (
+        section[:head_size]
+        + "\n\n[ ... middle omitted to stay within token limit ... ]\n\n"
+        + section[-tail_size:]
+    )
 
 
 def find_downloaded_10k_path(download_root: Path, ticker: str) -> Optional[Path]:
@@ -162,25 +211,21 @@ def get_ai_summary_and_report(
     ticker: str,
 ) -> tuple[str, str]:
     """
-    Use Gemini 1.5 Flash to produce:
-    1) A detailed three-part summary (financial health, profitability, key risks).
-    2) A CFA Investment Report-style section (Executive Summary, Investment Thesis, Risks, etc.).
-    Only Item 7 and Item 8 are sent; sections are trimmed to avoid token/rate limits.
+    Produce detailed analysis and CFA report. Only Item 7 and Item 8 are sent (pre-filtered).
+    Sections are smart-chunked (head + tail) when long to keep token use low and avoid 429.
     """
     model = get_gemini_model(api_key)
 
-    # Keep payload smaller to reduce token usage and avoid 429 rate limits
-    max_chars_per_section = 40000
-    if len(item7_text) > max_chars_per_section:
-        item7_text = item7_text[:max_chars_per_section] + "\n\n[ ... section truncated ... ]"
-    if len(item8_text) > max_chars_per_section:
-        item8_text = item8_text[:max_chars_per_section] + "\n\n[ ... section truncated ... ]"
+    # Smart chunking: when over limit, keep head + tail (figures often at start/end)
+    max_chars_per_section = 30000
+    item7_text = smart_chunk(item7_text, max_chars=max_chars_per_section)
+    item8_text = smart_chunk(item8_text, max_chars=max_chars_per_section)
 
-    user_prompt = f"""You are a CFA charterholder and senior equity analyst writing for an accounting and finance audience. Your analysis must be evidence-based, cite specific figures from the 10-K where relevant, and follow professional investment report standards. Use British English throughout (e.g. analyse, summarise, colour, favour, organisation).
+    user_prompt = f"""You are a CFA charterholder and senior equity analyst. Use British English. Omit unnecessary qualifiers and filler; focus on figures, risks, and material facts.
 
-Analyse the following 10-K content for company ticker: {ticker}.
+Analyse the following 10-K excerpts for company ticker: {ticker}. The text below contains ONLY Item 7 (MD&A) and Item 8 (Financial Statements)—other sections have been pre-filtered out.
 
-Use the FULL text provided below (Item 7 MD&A and Item 8 Financial Statements) to produce a thorough, detailed analysis. Do not summarise superficially—reference specific numbers, trends, and risk disclosures.
+Use the provided text to produce a thorough, evidence-based analysis. Cite specific numbers and risk disclosures where relevant.
 
 First, write a "DETAILED ANALYSIS" section with exactly three paragraphs (use subheadings):
 1. **Financial Health**: Liquidity (current ratio, cash position, credit facilities), leverage (debt/equity, interest coverage), capital structure, and any covenant or refinancing risks. Cite figures from the statements.
@@ -241,12 +286,11 @@ Keep the entire response in British English. Use clear section headers (e.g. ## 
 
 
 def get_metrics_table_from_ai(api_key: str, item8_text: str, ticker: str) -> pd.DataFrame:
-    """Ask Gemini to extract Revenue, Net Income, Operating Cash Flow by year from Item 8 and return a table."""
+    """Extract Revenue, Net Income, Operating Cash Flow from Item 8 only (pre-filtered)."""
     model = get_gemini_model(api_key)
-    max_item8_chars = 25000
-    excerpt = item8_text[:max_item8_chars] if len(item8_text) > max_item8_chars else item8_text
+    excerpt = smart_chunk(item8_text, max_chars=25000)
 
-    prompt = f"""You are a financial analyst. From the 10-K Item 8 excerpt below for company {ticker}, extract the following for the most recent 3–5 fiscal years (if available):
+    prompt = f"""You are a financial analyst. From the 10-K Item 8 excerpt below for company {ticker}, extract the following for the most recent 3–5 fiscal years. Focus only on figures; omit filler text.
 - Revenue (or Net sales)
 - Net Income (or Net earnings attributable to common shareholders)
 - Cash flows from operating activities (Operating Cash Flow)
@@ -299,14 +343,19 @@ def run_analysis(ticker: str, api_key: str, email: str, analysis_only: bool = Fa
         if not full_text:
             raise ValueError("Could not extract text from the 10-K.")
 
-    item7 = find_item_section(full_text, 7, ["Management's Discussion", "MD&A", "Analysis"])
-    item8 = find_item_section(full_text, 8, ["Financial Statements", "Consolidated"])
+    # Pre-filter: drop PART I, ITEM 1–6; work only from Item 7 onward (reduces tokens)
+    text_from_item7 = prefilter_after_item7(full_text)
 
-    # Use only extracted Item 7 / Item 8; fallback to trimmed full text if sections not found
+    # Section extraction: only Item 7 (MD&A) and Item 8 (Financial Statements)
+    item7 = find_item_section(text_from_item7, 7, ["Management's Discussion", "MD&A", "Analysis"])
+    item8 = find_item_section(text_from_item7, 8, ["Financial Statements", "Consolidated"])
+
+    # Fallback if extraction fails: use trimmed slice (still no full document)
     if not item7:
-        item7 = full_text[:80000]
+        item7 = smart_chunk(text_from_item7[:120000], max_chars=30000)
     if not item8:
-        item8 = full_text[80000:160000] if len(full_text) > 80000 else full_text[:80000]
+        remainder = text_from_item7[100000:220000] if len(text_from_item7) > 100000 else text_from_item7
+        item8 = smart_chunk(remainder, max_chars=30000)
 
     detailed_summary, cfa_report = get_ai_summary_and_report(api_key, full_text, item7, item8, ticker)
     if analysis_only:
