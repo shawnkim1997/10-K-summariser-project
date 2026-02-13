@@ -1,22 +1,42 @@
-# 10-K Financial Analyzer
+# All-in-One Financial Analysis Dashboard
 
-A web app that fetches the latest 10-K from SEC EDGAR for a given stock ticker and uses a **hybrid architecture**: **qualitative** analysis (Item 7 MD&A only) via **Google Gemini**, and **quantitative** metrics (Revenue, Net Income, Operating Cash Flow) from **yfinance**. CFA-style report and key financials in one place.
+A **cost-effective** Streamlit app that unifies **qualitative AI-driven insights** and **quantitative valuation** in a single workflow. **Hybrid architecture:** Gemini powers narrative analysis (10-K MD&A and Risk Factors); all numbers—DCF inputs and peer multiples—come from **yfinance**, keeping API costs low and numerical accuracy high.
+
+The app is organised into **three tabs:**
+
+| Tab | Purpose |
+|-----|---------|
+| **1. 10-K Qualitative Insights** | SEC EDGAR 10-K → Item 1A (Risk Factors) + Item 7 (MD&A) → cleaned text → Gemini. Output: management’s tone (sentiment), key strategic shifts, and major hidden risks. |
+| **2. DCF Valuation** | yfinance for FCF, Debt, Cash, Shares. Sliders for WACC, terminal growth, FCF growth. **3-scenario model** (Bull / Base / Bear) with intrinsic value per share. No LLM. |
+| **3. Industry Comps** | Comma-separated competitor tickers → yfinance **Forward P/E**, **EV/EBITDA**, **P/B** → comparison table. |
 
 ---
 
 ## Features
 
-- **Hybrid processing (qualitative + quantitative):**
-  - **Qualitative:** Only **Item 7 (MD&A)** is sent to Gemini for analysis of management’s strategy, market risks, and sentiment—no Item 8 (financial statements) to the AI, which cuts token use and avoids number hallucination.
-  - **Quantitative:** Financial metrics (Revenue, Net Income, Operating Cash Flow) are fetched directly from **yfinance**—fast, accurate, and no extra API tokens.
-- **HTML cleansing:** Before sending Item 7 to the LLM, the app strips remaining HTML tags, collapses whitespace, and removes page numbers to compress tokens.
-- **Selective extraction:** The 10-K is parsed with regex; only content from Item 7 onward is used for AI; PART I and Items 1–6 are dropped.
-- **Smart chunking:** Long Item 7 text is trimmed to head + tail to stay within token limits.
-- **Two-step progress:** Step 1 (download + extract Item 7), Step 2 (Gemini analysis + yfinance metrics).
-- **Analysis only mode:** Optional hide for the metrics table (Gemini still runs once on Item 7).
-- **S&P 500 reference list:** Sample table of company names and tickers at the bottom for quick lookup.
+- **Tab 1 — 10-K Qualitative Insights:** Item 1A + Item 7 from SEC EDGAR; HTML cleaned; one Gemini call for tone, strategic shifts, and hidden risks.
+- **Tab 2 — DCF Valuation:** FCF, Debt, Cash, Shares from yfinance; WACC / terminal growth / FCF growth sliders; Bull/Base/Bear intrinsic value per share; no LLM.
+- **Tab 3 — Industry Comps:** Comma-separated tickers; Forward P/E, EV/EBITDA, P/B from yfinance; comparison table.
+- **Error handling:** Try/except for SEC EDGAR and yfinance; clear messages when data is missing or requests fail.
+- **UI:** Three-tab layout, sidebar for API key and SEC email, professional layout.
 
-**Typical run time:** About **1–2 minutes** (one Gemini call; yfinance metrics are near-instant). If the API is rate-limited, the app waits 60 seconds and retries automatically.
+**Run time:** Tab 1 ≈ 1–2 min (one Gemini call); Tabs 2–3 use yfinance (seconds). Rate limit: 60s retry.
+
+---
+
+## Project Origin & Vision
+
+### The Origin — The Walk
+
+The core idea for this all-in-one architecture came during a **quiet walk**. I was deep in thought about the inefficiencies and fragmentation of traditional equity research: narrative buried in 200-page filings, valuation models in separate spreadsheets, and comps scattered across different tools. It became clear that what we need is not more dashboards, but **one seamless workflow**—where qualitative AI insights and quantitative valuation models live in the same place, speak the same language, and serve the same decision. That moment crystallised into the design you see here: **unified, cost-conscious, and built for the analyst who thinks in both words and numbers.**
+
+### The Vision — Commercialization
+
+This repository is a **functional MVP (Minimum Viable Product)** and **demo**. It proves the concept: hybrid architecture works; 10-K + DCF + comps can sit in a single interface; and the unit economics (one Gemini call for narrative, free data for the rest) scale. The code is production-minded but not yet productised—it is the foundation on which a commercial product will be built.
+
+### Future Roadmap
+
+The **ultimate goal** is to launch this as a **fully commercialised B2C/B2B SaaS** application. We aim to serve **retail investors** who want institutional-grade structure without the complexity, and **finance professionals** (equity analysts, portfolio managers, corporate development) who want to move from filing → insight → valuation in one flow. Data-driven, transparent, and built by someone who cares as much about the quality of the analysis as the quality of the code. This project is the first step on that path.
 
 ---
 
@@ -61,15 +81,39 @@ For full technical notes and code references, see **[TECHNICAL_NOTES.md](./TECHN
 
 ## How to Run
 
+**1. Go to the project folder**
 ```bash
-cd "/path/to/FQDC Project"
-python3 -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+cd "/Users/seonpil/Documents/FQDC Project"
+```
+
+**2. Activate the virtual environment** (required so `pip` and `streamlit` are found)
+- **Mac / Linux:**
+  ```bash
+  source venv/bin/activate
+  ```
+- **Windows (PowerShell):**
+  ```powershell
+  venv\Scripts\Activate.ps1
+  ```
+After activation, your prompt usually shows `(venv)`.
+
+**3. Install dependencies** (only needed once, or when requirements change)
+```bash
 pip install -r requirements.txt
+```
+
+**4. Start the app**
+```bash
 streamlit run app.py
 ```
 
-Open the sidebar to set **Google API Key** and **SEC EDGAR Email**, then enter a ticker (e.g. `AAPL`, `MSFT`) and click **Run Analysis**. Use **Analysis only (1 API call)** if you hit rate limits.
+If you don’t have a `venv` folder yet, create it first:
+```bash
+python3 -m venv venv
+source venv/bin/activate   # then steps 3 and 4
+```
+
+Open the sidebar to set **Google API Key** and **SEC EDGAR Email**, then use the three tabs (10-K Insights, DCF, Comps) as needed.
 
 ---
 
