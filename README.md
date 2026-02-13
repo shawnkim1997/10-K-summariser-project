@@ -4,6 +4,18 @@ A web app that fetches the latest 10-K from SEC EDGAR for a given stock ticker, 
 
 ---
 
+## Features
+
+- **Selective section extraction:** Only Item 7 (MD&A) and Item 8 (Financial Statements) are sent to the API; PART I and Items 1–6 are pre-filtered to reduce tokens.
+- **Smart chunking:** Long sections are trimmed to head + tail to stay within token limits while keeping high-signal content.
+- **Two-step progress:** The UI shows Step 1 (download + extract) and Step 2 (Gemini analysis) so you can see where time is spent.
+- **Analysis only mode:** Optional single API call (summary + CFA report only) to reduce rate-limit issues.
+- **S&P 500 reference list:** A table of company names and tickers (sample) is shown at the bottom of the page for quick lookup.
+
+**Typical run time:** About **1–2 minutes** (roughly 1 minute with “Analysis only” enabled; up to 2 minutes with metrics). If the API is rate-limited, the app waits 60 seconds and retries automatically.
+
+---
+
 ## Tech Stack
 
 - **UI**: Streamlit  
@@ -61,6 +73,16 @@ Open the sidebar to set **Google API Key** and **SEC EDGAR Email**, then enter a
 ├── README.md           # This file
 └── TECHNICAL_NOTES.md  # Technical challenge & solution (for reference)
 ```
+
+---
+
+## Recent updates
+
+- **Selective extraction & pre-filtering:** Regex-based extraction of Item 7 and Item 8 only; content before Item 7 is dropped to cut token use.
+- **Smart chunking:** Sections over ~30k characters are reduced to head + tail before sending to Gemini.
+- **Progress steps:** Step 1 (download + extract) and Step 2 (Gemini analysis, ~30–90s) with clear spinner messages.
+- **S&P 500 list:** Bottom of the page now includes a sample table of S&P 500 companies with **company name** and **ticker** for easy reference.
+- **Run time:** Results usually appear within 1–2 minutes under normal conditions.
 
 ---
 
