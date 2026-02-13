@@ -329,8 +329,8 @@ Item 8 excerpt:
         return pd.DataFrame()
 
 
-def run_analysis(ticker: str, api_key: str, email: str, analysis_only: bool = False) -> tuple[str, str, str, pd.DataFrame]:
-    """Download 10-K, extract text, get Item 7/8, return detailed summary, CFA report, and optionally metrics table."""
+def download_and_extract_sections(ticker: str, email: str) -> tuple[str, str, str]:
+    """Download 10-K, pre-filter, extract Item 7 & 8 only. Returns (full_text, item7, item8)."""
     Downloader = get_edgar_downloader()
     with tempfile.TemporaryDirectory() as tmpdir:
         download_root = Path(tmpdir)
@@ -343,19 +343,22 @@ def run_analysis(ticker: str, api_key: str, email: str, analysis_only: bool = Fa
         if not full_text:
             raise ValueError("Could not extract text from the 10-K.")
 
-    # Pre-filter: drop PART I, ITEM 1–6; work only from Item 7 onward (reduces tokens)
     text_from_item7 = prefilter_after_item7(full_text)
-
-    # Section extraction: only Item 7 (MD&A) and Item 8 (Financial Statements)
     item7 = find_item_section(text_from_item7, 7, ["Management's Discussion", "MD&A", "Analysis"])
     item8 = find_item_section(text_from_item7, 8, ["Financial Statements", "Consolidated"])
 
-    # Fallback if extraction fails: use trimmed slice (still no full document)
     if not item7:
         item7 = smart_chunk(text_from_item7[:120000], max_chars=30000)
     if not item8:
         remainder = text_from_item7[100000:220000] if len(text_from_item7) > 100000 else text_from_item7
         item8 = smart_chunk(remainder, max_chars=30000)
+
+    return full_text, item7, item8
+
+
+def run_analysis(ticker: str, api_key: str, email: str, analysis_only: bool = False) -> tuple[str, str, str, pd.DataFrame]:
+    """Download 10-K, extract Item 7/8, call Gemini; return summary, report, full_text, metrics table."""
+    full_text, item7, item8 = download_and_extract_sections(ticker, email)
 
     detailed_summary, cfa_report = get_ai_summary_and_report(api_key, full_text, item7, item8, ticker)
     if analysis_only:
@@ -396,10 +399,48 @@ with st.sidebar:
 
 ticker = st.text_input("Stock Ticker (e.g. AAPL, MSFT)", value="AAPL", max_chars=10).strip().upper()
 if not ticker:
-    st.info("Enter a ticker and click 'Run Analysis'.")
-    st.stop()
+    st.info("Enter a ticker and click 'Run Analysis', or pick one from the S&P 500 list below.")
+
+# S&P 500 sample: (Company name, Ticker) – shown at bottom
+SP500_SAMPLE = [
+    ("Apple Inc.", "AAPL"), ("Microsoft Corporation", "MSFT"), ("Amazon.com Inc.", "AMZN"),
+    ("NVIDIA Corporation", "NVDA"), ("Alphabet Inc. (Google)", "GOOGL"), ("Meta Platforms Inc. (Facebook)", "META"),
+    ("Berkshire Hathaway Inc.", "BRK.B"), ("Tesla Inc.", "TSLA"), ("JPMorgan Chase & Co.", "JPM"),
+    ("Visa Inc.", "V"), ("UnitedHealth Group Inc.", "UNH"), ("Procter & Gamble Co.", "PG"),
+    ("Exxon Mobil Corporation", "XOM"), ("Johnson & Johnson", "JNJ"), ("Mastercard Inc.", "MA"),
+    ("Chevron Corporation", "CVX"), ("Home Depot Inc.", "HD"), ("Merck & Co. Inc.", "MRK"),
+    ("AbbVie Inc.", "ABBV"), ("Costco Wholesale Corporation", "COST"),
+    ("PepsiCo Inc.", "PEP"), ("Coca-Cola Company", "KO"), ("Pfizer Inc.", "PFE"),
+    ("Walmart Inc.", "WMT"), ("Netflix Inc.", "NFLX"), ("Adobe Inc.", "ADBE"),
+    ("Salesforce Inc.", "CRM"), ("Comcast Corporation", "CMCSA"), ("Cisco Systems Inc.", "CSCO"),
+    ("Oracle Corporation", "ORCL"), ("Intel Corporation", "INTC"), ("American Express Company", "AXP"),
+    ("Bank of America Corp.", "BAC"), ("Wells Fargo & Company", "WFC"), ("Verizon Communications Inc.", "VZ"),
+    ("AT&T Inc.", "T"), ("Disney (Walt Disney Co.)", "DIS"), ("Nike Inc.", "NKE"),
+    ("McDonald's Corporation", "MCD"), ("Starbucks Corporation", "SBUX"), ("Goldman Sachs Group Inc.", "GS"),
+    ("Morgan Stanley", "MS"), ("Boeing Company", "BA"), ("Caterpillar Inc.", "CAT"),
+    ("3M Company", "MMM"), ("Honeywell International Inc.", "HON"), ("IBM (International Business Machines)", "IBM"),
+    ("Qualcomm Inc.", "QCOM"), ("Texas Instruments Inc.", "TXN"), ("Amgen Inc.", "AMGN"),
+    ("Gilead Sciences Inc.", "GILD"), ("Bristol-Myers Squibb Company", "BMY"), ("Eli Lilly and Company", "LLY"),
+    ("Union Pacific Corporation", "UNP"), ("Lockheed Martin Corporation", "LMT"), ("Raytheon Technologies Corp.", "RTX"),
+    ("Target Corporation", "TGT"), ("Lowe's Companies Inc.", "LOW"), ("Booking Holdings Inc.", "BKNG"),
+    ("PayPal Holdings Inc.", "PYPL"), ("Broadcom Inc.", "AVGO"), ("Schlumberger Ltd.", "SLB"),
+    ("ConocoPhillips", "COP"), ("Phillips 66", "PSX"),
+    ("Ford Motor Company", "F"), ("General Motors Company", "GM"), ("General Electric Company", "GE"),
+    ("FedEx Corporation", "FDX"), ("United Parcel Service Inc.", "UPS"), ("Delta Air Lines Inc.", "DAL"),
+    ("American Airlines Group Inc.", "AAL"), ("Southwest Airlines Co.", "LUV"),
+    ("Abbott Laboratories", "ABT"), ("Thermo Fisher Scientific Inc.", "TMO"), ("Danaher Corporation", "DHR"),
+    ("Accenture plc", "ACN"), ("Intuit Inc.", "INTU"),
+    ("ServiceNow Inc.", "NOW"), ("Workday Inc.", "WDAY"), ("Snowflake Inc.", "SNOW"),
+    ("Zoom Video Communications Inc.", "ZM"), ("Spotify Technology S.A.", "SPOT"), ("Uber Technologies Inc.", "UBER"),
+    ("Airbnb Inc.", "ABNB"), ("Moderna Inc.", "MRNA"), ("Regeneron Pharmaceuticals Inc.", "REGN"),
+]
+
+st.caption("Select a ticker above or choose from the list below.")
 
 if st.button("Run Analysis"):
+    if not ticker:
+        st.error("Please enter or select a stock ticker.")
+        st.stop()
     api_key = st.session_state.get("google_api_key", "")
     email = st.session_state.get("email", "")
     if not api_key:
@@ -410,51 +451,63 @@ if st.button("Run Analysis"):
         st.stop()
 
     analysis_only = st.session_state.get("analysis_only", False)
-    with st.spinner("Downloading 10-K and running Gemini analysis (if rate limited, waiting up to 60s before retry)..."):
-        try:
-            detailed_summary, cfa_report, full_text, df_metrics = run_analysis(ticker, api_key, email, analysis_only=analysis_only)
-            st.success("Analysis complete.")
+    try:
+        with st.spinner("Step 1/2: Downloading 10-K and extracting Item 7 & 8 (selective sections only)..."):
+            full_text, item7, item8 = download_and_extract_sections(ticker, email)
 
-            st.subheader("Detailed Analysis (Financial Health, Profitability, Key Risks)")
-            st.markdown(detailed_summary)
-
-            st.subheader("CFA Investment Report")
-            st.markdown(cfa_report)
-
-            st.subheader("Key Financial Metrics (Revenue, Net Income, Operating Cash Flow)")
-            if not df_metrics.empty:
-                st.dataframe(df_metrics, use_container_width=True)
-            elif analysis_only:
-                st.info("Metrics skipped (Analysis only mode). Turn off 'Analysis only' in Settings to fetch metrics.")
-            else:
-                st.info("No metrics extracted. Check the full Item 8 text.")
-
-            with st.expander("View excerpt of extracted 10-K text"):
-                st.text(full_text[:15000] + ("..." if len(full_text) > 15000 else ""))
-
-        except FileNotFoundError as e:
-            st.error(str(e))
-        except ValueError as e:
-            st.error(str(e))
-        except RuntimeError as e:
-            st.error(str(e))
+        with st.spinner("Step 2/2: Running Gemini analysis (typically 30–90s; if rate limited, we wait 60s then retry)..."):
+            detailed_summary, cfa_report = get_ai_summary_and_report(api_key, full_text, item7, item8, ticker)
             if analysis_only:
-                st.warning("You already have **Analysis only** on (1 API call). The limit is on Google's side — wait **2–5 minutes** without clicking, then press Run Analysis again.")
+                df_metrics = pd.DataFrame()
             else:
-                st.info("Wait 2–5 minutes, then try again. Or enable 'Analysis only (1 API call)' in Settings to reduce usage.")
-        except Exception as e:
-            err_msg = str(e).lower()
-            if "429" in err_msg or ("resource" in err_msg and "exhausted" in err_msg):
-                st.error("Rate limit exceeded. Please try again in a few minutes.")
-                if analysis_only:
-                    st.warning("You already have **Analysis only** on. Google's free tier limit is reached — wait **2–5 minutes**, then press Run Analysis again (no need to change settings).")
-                else:
-                    st.info("Wait 2–5 minutes, then retry. Or enable **Analysis only (1 API call)** in the sidebar.")
-            elif "404" in err_msg or "not found" in err_msg:
-                st.error("The selected model is not available. Please try again later or check Google AI Studio for available models.")
+                time.sleep(DELAY_BETWEEN_CALLS_SEC)
+                df_metrics = get_metrics_table_from_ai(api_key, item8, ticker)
+
+        st.success("Analysis complete.")
+        st.subheader("Detailed Analysis (Financial Health, Profitability, Key Risks)")
+        st.markdown(detailed_summary)
+        st.subheader("CFA Investment Report")
+        st.markdown(cfa_report)
+        st.subheader("Key Financial Metrics (Revenue, Net Income, Operating Cash Flow)")
+        if not df_metrics.empty:
+            st.dataframe(df_metrics, use_container_width=True)
+        elif analysis_only:
+            st.info("Metrics skipped (Analysis only mode). Turn off 'Analysis only' in Settings to fetch metrics.")
+        else:
+            st.info("No metrics extracted. Check the full Item 8 text.")
+        with st.expander("View excerpt of extracted 10-K text"):
+            st.text(full_text[:15000] + ("..." if len(full_text) > 15000 else ""))
+
+    except FileNotFoundError as e:
+        st.error(str(e))
+    except ValueError as e:
+        st.error(str(e))
+    except RuntimeError as e:
+        st.error(str(e))
+        if analysis_only:
+            st.warning("You already have **Analysis only** on (1 API call). The limit is on Google's side — wait **2–5 minutes** without clicking, then press Run Analysis again.")
+        else:
+            st.info("Wait 2–5 minutes, then try again. Or enable 'Analysis only (1 API call)' in Settings to reduce usage.")
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "429" in err_msg or ("resource" in err_msg and "exhausted" in err_msg):
+            st.error("Rate limit exceeded. Please try again in a few minutes.")
+            if analysis_only:
+                st.warning("You already have **Analysis only** on. Google's free tier limit is reached — wait **2–5 minutes**, then press Run Analysis again (no need to change settings).")
             else:
-                st.error("An error occurred. Please try again later.")
-                st.caption("If the problem persists, check your API key and internet connection.")
-            with st.expander("Error details (for troubleshooting)"):
-                st.code(repr(e), language="text")
-                st.caption("Share this with support if the issue continues.")
+                st.info("Wait 2–5 minutes, then retry. Or enable **Analysis only (1 API call)** in the sidebar.")
+        elif "404" in err_msg or "not found" in err_msg:
+            st.error("The selected model is not available. Please try again later or check Google AI Studio for available models.")
+        else:
+            st.error("An error occurred. Please try again later.")
+            st.caption("If the problem persists, check your API key and internet connection.")
+        with st.expander("Error details (for troubleshooting)"):
+            st.code(repr(e), language="text")
+            st.caption("Share this with support if the issue continues.")
+
+st.divider()
+st.subheader("S&P 500 companies (sample) — Company name & Ticker")
+st.caption("Click a row to copy the ticker, or type it in the box above.")
+df_sp = pd.DataFrame(SP500_SAMPLE, columns=["Company name", "Ticker"])
+with st.expander("Show list", expanded=True):
+    st.dataframe(df_sp, use_container_width=True, hide_index=True)
