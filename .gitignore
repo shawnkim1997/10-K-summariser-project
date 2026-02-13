@@ -1,5 +1,6 @@
 venv/
 .env
+.app_prefs.json
 __pycache__/
 .DS_Store
 

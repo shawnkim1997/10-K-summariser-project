@@ -6,19 +6,19 @@ The app is organised into **three tabs:**
 
 | Tab | Purpose |
 |-----|---------|
-| **1. 10-K Qualitative Insights** | SEC EDGAR 10-K → Item 1A (Risk Factors) + Item 7 (MD&A) → cleaned text → Gemini. Output: management’s tone (sentiment), key strategic shifts, and major hidden risks. |
-| **2. DCF Valuation** | yfinance for FCF, Debt, Cash, Shares. Sliders for WACC, terminal growth, FCF growth. **3-scenario model** (Bull / Base / Bear) with intrinsic value per share. No LLM. |
-| **3. Industry Comps** | Comma-separated competitor tickers → yfinance **Forward P/E**, **EV/EBITDA**, **P/B** → comparison table. |
+| **1. 10-K & MD&A Insights** | SEC EDGAR 10-K → Item 1A + Item 7 → cleaned text → Gemini. Output: management’s tone (sentiment), key strategic shifts, and major hidden risks. |
+| **2. 3-Scenario DCF Valuation** | **10-year 2-stage DCF** (Y1–5 growth, Y6–10 fade). Smart defaults (CAPM WACC, revenue growth). Wall Street Assumptions panel: analyst consensus + Damodaran WACC/ERP/Rf. Bull/Base/Bear intrinsic value. |
+| **3. Top-Down Sector Analysis** | Industry selectbox → peer comps (P/E, EV/EBITDA, P/B); conditional formatting; **Generate Industry Outlook** (Gemini) for macro trends. |
 
 ---
 
 ## Features
 
-- **Tab 1 — 10-K Qualitative Insights:** Item 1A + Item 7 from SEC EDGAR; HTML cleaned; one Gemini call for tone, strategic shifts, and hidden risks.
-- **Tab 2 — DCF Valuation:** FCF, Debt, Cash, Shares from yfinance; WACC / terminal growth / FCF growth sliders; Bull/Base/Bear intrinsic value per share; no LLM.
-- **Tab 3 — Industry Comps:** Comma-separated tickers; Forward P/E, EV/EBITDA, P/B from yfinance; comparison table.
-- **Error handling:** Try/except for SEC EDGAR and yfinance; clear messages when data is missing or requests fail.
-- **UI:** Three-tab layout, sidebar for API key and SEC email, professional layout.
+- **Tab 1 — 10-K & MD&A:** Item 1A + Item 7; DuPont, Altman Z, red flags, YoY; sector/industry badge; sector-specific metrics (Tech/Retail/Financials); Gemini comparative MD&A with sector-aware Non-GAAP KPI table. TTM fallback and N/A handling when yfinance rows are missing.
+- **Tab 2 — DCF:** 10-year 2-stage model (5-year growth + 5-year fade to terminal rate). Base FCF = OCF − CapEx; shares/debt/cash from yfinance with robust fallbacks; manual inputs only as last resort. Smart slider defaults (Beta/CAPM WACC, 2.5% terminal, revenue/earnings growth). Reference panel: analyst consensus (target price, recommendation, revenue/earnings growth) and Damodaran sector WACC, ERP, 10Y risk-free rate with methodology link.
+- **Tab 3 — Sector Analysis:** Predefined sectors with top 5 tickers each; comps table with N/A for missing multiples; green/red formatting; AI Industry Outlook (Gemini) for macro trends and risks.
+- **Error handling:** Try/except for SEC EDGAR, yfinance, and Gemini; clear messages and optional manual overrides so the app keeps running.
+- **UI:** Three-tab layout, sidebar (API key, SEC email, company/ticker search), optional "Remember API key & email" (local prefs file).
 
 **Run time:** Tab 1 ≈ 1–2 min (one Gemini call); Tabs 2–3 use yfinance (seconds). Rate limit: 60s retry.
 
@@ -37,6 +37,27 @@ This repository is a **functional MVP (Minimum Viable Product)** and **demo**. I
 ### Future Roadmap
 
 The **ultimate goal** is to launch this as a **fully commercialised B2C/B2B SaaS** application. We aim to serve **retail investors** who want institutional-grade structure without the complexity, and **finance professionals** (equity analysts, portfolio managers, corporate development) who want to move from filing → insight → valuation in one flow. Data-driven, transparent, and built by someone who cares as much about the quality of the analysis as the quality of the code. This project is the first step on that path.
+
+---
+
+## Design Rationale & Interview Notes
+
+*(Why certain features were built the way they were — useful for interviews and discussions.)*
+
+- **Undergraduate automation mindset**  
+  As an undergraduate student, I realised that rather than just learning Excel and basic Python and doing everything manually, **automating the full workflow with AI and programmatic data** is far more powerful. This dashboard is the result: one place for 10-K narrative (Gemini), numbers (yfinance), DCF, and comps, so the analyst can focus on judgment instead of copy-pasting between tools.
+
+- **Why a 10-year DCF instead of 5 years**  
+  A standard 5-year projection is often **too short for practical, real-world corporate analysis**. Many companies have growth that extends beyond five years, and terminal value then dominates the result, which can overstate or misstate value. The **10-year 2-stage model** (Stage 1: Years 1–5 at the chosen FCF growth rate; Stage 2: Years 6–10 with growth **linearly fading** down to the terminal growth rate) is closer to how institutional DCFs are built and avoids absurd valuations for high-growth names.
+
+- **Integrating Damodaran’s academic baselines**  
+  I regularly read valuation literature and **wanted to integrate Aswath Damodaran’s academic baselines directly into the app**. The “Reference: Analyst & Macro Assumptions” panel shows sector WACC benchmarks (e.g. Software 8.5%, Retail 7.5%, Hardware 9.0%, Financials 8.0%), US equity risk premium (~4.6%), and the 10-year risk-free rate (~4.2%), with a link to his data and methodology so users can verify and align their assumptions with established research.
+
+- **Consensus numbers next to the DCF sliders**  
+  Having **analyst consensus data (target price, recommendation, revenue/earnings growth) right next to the DCF sliders** makes it much easier to make informed adjustments. Instead of guessing WACC or growth, the user can compare their inputs to both consensus and Damodaran’s macro baselines in one view, like a professional equity research dashboard.
+
+- **Commercialization**  
+  Once the app’s **completeness and robustness reach a higher professional standard**, my ultimate goal is to **fully commercialise it** (e.g. B2C/B2B SaaS). The current codebase is built as a production-minded MVP and demo to validate the hybrid architecture and user flow before scaling.
 
 ---
 
@@ -132,16 +153,39 @@ Open the sidebar to set **Google API Key** and **SEC EDGAR Email**, then use the
 
 ## Update history (Changelog)
 
-Updates are listed in **reverse chronological order (newest first)**.
+Updates are listed in **reverse chronological order (newest first)**. Each row summarises **what** was added and **why** (where relevant).
 
 | Date (UTC) | Updates |
 |------------|---------|
-| **2025-02-12 15:30** | **Dynamic Sector-Specific Analysis:** (1) **DuPont display:** Replace None/NaN with "N/A" in the table so missing rows (e.g. SBUX) do not break the layout. (2) **Sector & industry badge:** Auto-detect from `ticker.info` (sector/industry) and show Sector · Industry caption at top of Tab 1. (3) **Sector-specific metrics:** Technology (Rule of 40, FCF margin, R&D % of revenue), Retail/Consumer (inventory turnover, operating margin), Financials (ROE, ROA) — Tab 1 "Sector-specific metrics" block. (4) **Tab 2:** For Financial sector, add caption that FCF/EBITDA are less relevant and to refer to ROE/ROA in Tab 1. (5) **Gemini MD&A:** Add sector/industry args to `get_mda_comparative_insights`; prompt instructs extraction of industry-specific Non-GAAP KPIs (Same-Store Sales, ARR/NDR, DAU/MAU, etc.) in a markdown table. |
-| **2025-02-12 11:00** | **Data robustness & TTM fallback:** (1) yfinance **KeyError/NaN handling:** `_get_row_series` with try/except for financial/balance-sheet row access; `_na(x)` for consistent "N/A" display. (2) **TTM fallback:** When annual `financials`/`balance_sheet` are missing or empty, use sum of first 4 quarters from `quarterly_financials` and latest quarter from `quarterly_balance_sheet` for DuPont/Altman. (3) **`get_sector_industry(ticker)`** added (cached sector/industry). (4) `get_dupont_altman_redflags_yoy` returns empty dict on exception; stronger column/date checks when building TTM. |
-| **2025-02-12 09:00** | **Hybrid architecture:** Send only Item 7 (MD&A) to Gemini; fetch financial metrics from **yfinance**. Add **HTML cleansing** (strip tags, collapse whitespace, remove page numbers). Change prompt to focus on management strategy, risks, and **sentiment** analysis. Add **find_toc.py** (SEC EDGAR HTML URL → Table of Contents extraction). Overhaul README for hybrid flow, Tech Stack, and Technical Challenge. |
-| **2025-02-12 08:45** | Add **Update history (Changelog)** to README and include `find_toc.py` in Project Structure. |
-| **2025-02-01** (approx.) | Selective extraction: send only Item 7 & 8 to the API. 429 handling: retry with 60s wait, "Analysis only" option, timeout/404/error messages. Switch to Google **Gemini** and add `GOOGLE_API_KEY` (.env and sidebar). CFA Investment Report, metrics table, two-step spinners. |
-| **2025-01-XX** (approx.) | Initial release: SEC EDGAR 10-K download, Item 7 & 8 extraction, LLM analysis, Streamlit UI. S&P 500 sample list (company name and ticker). |
+| **2025-02-13** | **Design Rationale & README:** New section "Design Rationale & Interview Notes" (undergrad automation mindset, 10y DCF rationale, Damodaran integration, consensus-panel rationale, commercialization). README Features and tab table updated to reflect 10Y 2-stage DCF, sector analysis, and Wall Street Assumptions panel. Changelog expanded with more detailed entries. |
+| **2025-02-13** | **Institutional DCF & Wall Street panel:** (1) **10-year 2-stage DCF:** Stage 1 (Y1–5) at user FCF growth; Stage 2 (Y6–10) linear fade from that rate to terminal growth (avoids absurd valuations for high-growth stocks). TV at Year 10; all FCFs + TV discounted to PV. (2) **Wall Street Assumptions panel** (expander below sliders): **Left column** — Analyst consensus from yfinance: target mean price, recommendation, revenue growth est., earnings growth est. (N/A if missing). **Right column** — Damodaran macro baseline: sector WACC map (Software 8.5%, Retail 7.5%, Hardware 9.0%, Financials 8.0%, etc.), US ERP ~4.6%, 10Y risk-free ~4.2%, plus markdown link to his WACC data page for methodology. Company sector matched via `get_sector_industry` for Damodaran WACC. |
+| **2025-02-13** | **Smart DCF defaults:** Slider defaults no longer hardcoded. **WACC:** CAPM approximation using `ticker.info.get('beta')` (default 1.0), Risk-free 4%, MRP 5%; default WACC = 4 + Beta×5, rounded to 1 decimal. **Terminal growth:** Fixed at 2.5% (Damodaran-style, long-term US GDP). **FCF growth:** From `revenueGrowth` or `earningsGrowth` (e.g. 0.15 → 15%); fallback 8%. Caption above sliders: "Slider defaults are auto-generated based on the company's Beta (CAPM) and revenue growth estimates." |
+| **2025-02-13** | **Robust DCF data & comps:** (1) **Shares/Debt/Cash:** Multi-step fallback (fast_info → info → balance sheet) so S&P 500 names rarely need manual input. Shares: `fast_info.shares` → `sharesOutstanding` → `impliedSharesOutstanding`; display as "X.XXB Shares (real-time, auto-fetched)". Manual number_input only when all sources fail. (2) **Tab 3 redesign — Top-down sector analysis:** Manual ticker input removed. `SECTORS` dict (e.g. Semiconductors, Software & Cloud, Consumer Retail, Financials, Healthcare) with top 5 tickers each; st.selectbox to choose industry; comps table auto-loads with spinner. yfinance keys fixed to `forwardPE`, `enterpriseToEbitda`, `priceToBook`; missing shown as N/A. Conditional formatting: lowest P/E and EV/EBITDA green, highest red. **Generate Industry Outlook** button: Gemini prompt for macro analyst-style report (12–18 month trends, growth drivers, headwinds/regulatory risks); report rendered in Markdown below table. |
+| **2025-02-13** | **Bulletproof DCF & Excel-style logic:** DCF no longer fails when yfinance misses data. Base FCF = OCF − CapEx; if Shares/Debt/Cash missing, st.number_input fallbacks. Three sliders (WACC, Terminal Growth, Projected FCF Growth) drive full DCF; intrinsic value vs current price (from yfinance) and Bull/Base/Bear table. Tab 1: Interest Coverage "nan%" fixed (N/A when Interest Expense 0 or missing). |
+| **2025-02-12 15:30** | **Dynamic Sector-Specific Analysis:** DuPont table None/NaN → "N/A". Sector & industry badge (Tab 1). Sector-specific metrics: Tech (Rule of 40, FCF margin, R&D % revenue), Retail (inventory turnover, operating margin), Financials (ROE, ROA). Tab 2 caption for Financials (FCF/EBITDA less relevant). Gemini MD&A: sector/industry passed in; prompt asks for industry-specific Non-GAAP KPIs in a markdown table. |
+| **2025-02-12 11:00** | **Data robustness & TTM fallback:** `_get_row_series` try/except; `_na(x)` for display. TTM fallback when annual financials/balance_sheet missing (quarterly sum / latest quarter). `get_sector_industry(ticker)` added. DuPont/Altman return empty dict on exception. |
+| **2025-02-12 09:00** | **Hybrid architecture:** Item 7 only to Gemini; yfinance for numbers. HTML cleansing, find_toc.py. Prompt: strategy, risks, sentiment. |
+| **2025-02-12 08:45** | Changelog and find_toc.py in Project Structure. |
+| **2025-02-12** | **Remember API key & email:** Optional "Remember API key & email (save locally)" checkbox; values stored in `.app_prefs.json` (in .gitignore); prefill on load; uncheck removes file. |
+| **2025-02-12** | **S&P 500 sample expander removed** from sidebar (user request). |
+| **2025-02-01** (approx.) | Item 7 & 8 selective extraction; 429 retry 60s; Gemini, GOOGLE_API_KEY; CFA report, metrics table. |
+| **2025-01-XX** (approx.) | Initial release: SEC EDGAR 10-K, Item 7 & 8, LLM analysis, Streamlit UI, S&P 500 sample list. |
+
+---
+
+## Push to GitHub
+
+From the project folder, commit and push (run these in your own terminal so authentication works):
+
+```bash
+cd "/Users/seonpil/Documents/FQDC Project"
+git add README.md app.py
+git status
+git commit -m "README: Design Rationale, detailed changelog, institutional DCF notes"
+git push origin main
+```
+
+If you use another branch or remote name, replace `main` or `origin` accordingly. If the repo is not yet initialised: `git init`, then `git remote add origin <your-repo-url>` before pushing.
 
 ---
 

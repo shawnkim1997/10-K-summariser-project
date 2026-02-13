@@ -6,12 +6,36 @@ All-in-One Financial Analysis Dashboard — Hybrid Architecture
 - Cost-effective: Gemini only for text; all numbers from yfinance.
 """
 
+import json
 import os
 import re
 import tempfile
 import time
 from pathlib import Path
 from typing import Optional
+
+# Local prefs file for "Remember me" (API key & email). Path is in .gitignore.
+_PREFS_PATH = Path(__file__).resolve().parent / ".app_prefs.json"
+
+
+def _load_prefs() -> dict:
+    """Load saved API key and email from local file. Keys: google_api_key, sec_email."""
+    try:
+        if _PREFS_PATH.exists():
+            with open(_PREFS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_prefs(google_api_key: str, sec_email: str) -> None:
+    """Save API key and email to local file (only if user opted in)."""
+    try:
+        with open(_PREFS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"google_api_key": (google_api_key or "").strip(), "sec_email": (sec_email or "").strip()}, f, indent=2)
+    except Exception:
+        pass
 
 import streamlit as st
 import pandas as pd
@@ -49,6 +73,15 @@ COMPANY_LIST = [
 ]
 COMPANY_OPTIONS = [f"{t} - {n}" for n, t in COMPANY_LIST]
 COMPANY_TICKER_MAP = {t: n for n, t in COMPANY_LIST}
+
+# Top-down sector analysis: industry → top 5 S&P 500 / NASDAQ tickers
+SECTORS = {
+    "Semiconductors & Hardware": ["NVDA", "AMD", "INTC", "TSM", "AVGO"],
+    "Software & Cloud": ["MSFT", "ADBE", "CRM", "PANW", "CRWD"],
+    "Consumer Retail": ["AMZN", "SBUX", "MCD", "WMT", "HD"],
+    "Financial Services": ["JPM", "BAC", "GS", "MS", "V"],
+    "Healthcare": ["LLY", "UNH", "JNJ", "ABBV", "MRK"],
+}
 
 
 def get_edgar_downloader():
@@ -399,6 +432,32 @@ Use clear headings. Do not invent figures. Keep the response focused and under 9
     return response.text.strip()
 
 
+def get_industry_outlook(api_key: str, industry_name: str, tickers: list) -> str:
+    """Gemini: Wall Street macro analyst-style Industry Outlook for the selected sector (12–18 months)."""
+    model = get_gemini_model(api_key)
+    ticker_list_str = ", ".join(str(t).upper() for t in tickers if t)
+    user_prompt = f"""Act as an elite Wall Street macro analyst. Provide a concise **Industry Outlook** report for the **{industry_name}** sector, which includes leading companies like {ticker_list_str}.
+
+Focus on:
+1. **Macro trends** affecting this industry over the next 12–18 months.
+2. **Major growth drivers** (e.g., AI, interest rates, consumer spending, regulation).
+3. **Key headwinds or regulatory risks** that could impact valuations or growth.
+
+Use clear headings. Be specific but concise. Keep the response under 600 words."""
+    full_content = user_prompt
+    try:
+        response = _generate_with_retry(
+            model, full_content, {"temperature": 0.4, "max_output_tokens": 2048}
+        )
+    except Exception as api_err:
+        if _is_rate_limit_error(api_err):
+            raise RuntimeError("Rate limit exceeded. Please try again in a few minutes.") from api_err
+        raise
+    if not response or not response.text:
+        return "No industry outlook generated."
+    return response.text.strip()
+
+
 # ---------- yfinance: raw statements & FCF = OCF - CapEx ----------
 def _safe_float(x) -> Optional[float]:
     if x is None or (isinstance(x, float) and (x != x or pd.isna(x))):
@@ -491,54 +550,131 @@ def get_5yr_financial_trend(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _format_shares_display(shares: float) -> str:
+    """Format share count for UI, e.g. 15.42B Shares or 1.2B Shares."""
+    if shares is None or shares <= 0:
+        return "N/A"
+    s = float(shares)
+    if s >= 1e9:
+        return f"{s / 1e9:.2f}B Shares"
+    if s >= 1e6:
+        return f"{s / 1e6:.2f}M Shares"
+    if s >= 1e3:
+        return f"{s / 1e3:.2f}K Shares"
+    return f"{s:.0f} Shares"
+
+
 @st.cache_data(ttl=300)
 def get_dcf_inputs(ticker: str) -> dict:
-    """FCF = OCF - CapEx from cashflow; baseline = latest year. Debt, Cash, Shares from balance sheet/info."""
-    if not yf:
-        return {}
+    """FCF = OCF - CapEx. Shares: fast_info.shares → info.sharesOutstanding → impliedSharesOutstanding → balance. Debt/Cash: fast_info → info → balance. Manual input only as last resort."""
+    out = {"fcf": None, "total_debt": 0.0, "cash": 0.0, "shares": None}
+    if not yf or not ticker:
+        return out
     try:
         t = yf.Ticker(ticker.upper())
-        info = t.info
-        cashflow = t.cashflow
-        balance = t.balance_sheet
+        info = t.info or {}
+        fast_info = getattr(t, "fast_info", None)
+        cashflow = getattr(t, "cashflow", None)
         if cashflow is None or cashflow.empty:
-            return {}
-        ocf = _get_row_series(cashflow, "Operating Cash Flow", "Cash From Operating Activities", "Cash From Operations")
-        capx = _get_row_series(cashflow, "Capital Expenditure", "Capital Expenditures", "Purchase Of Property Plant And Equipment")
-        if ocf is None or len(ocf) == 0:
-            return {}
-        latest_date = ocf.index[0]
-        ocf_val = _safe_float(ocf.iloc[0])
-        capx_val = _safe_float(capx.get(latest_date)) if capx is not None and latest_date in capx.index else (_safe_float(capx.iloc[0]) if capx is not None and len(capx) > 0 else None)
-        if capx_val is None:
-            capx_val = 0.0
-        latest_fcf = (ocf_val - capx_val) if ocf_val is not None else None
-        if latest_fcf is not None and (latest_fcf != latest_fcf or latest_fcf <= 0):
-            latest_fcf = None
-        total_debt = info.get("Total Debt")
-        cash = info.get("Cash And Cash Equivalents") or info.get("Cash")
-        shares = info.get("Shares Outstanding") or info.get("Float Shares")
-        if balance is not None and not balance.empty:
-            if total_debt is None and "Total Debt" in balance.index:
-                total_debt = _safe_float(balance.loc["Total Debt"].iloc[0])
-            if cash is None and "Cash And Cash Equivalents" in balance.index:
-                cash = _safe_float(balance.loc["Cash And Cash Equivalents"].iloc[0])
-        return {
-            "fcf": latest_fcf,
-            "total_debt": total_debt if total_debt is not None else 0,
-            "cash": cash if cash is not None else 0,
-            "shares": shares if shares is not None and shares > 0 else None,
-        }
+            cashflow = getattr(t, "quarterly_cashflow", None)
+        balance = getattr(t, "balance_sheet", None)
+        if balance is None or balance.empty:
+            balance = getattr(t, "quarterly_balance_sheet", None)
+
+        # ----- Shares Outstanding: multi-step fallback (no manual by default) -----
+        shares = None
+        if fast_info is not None:
+            try:
+                s = getattr(fast_info, "shares", None)
+                if s is None and hasattr(fast_info, "get"):
+                    s = fast_info.get("shares")
+                if s is not None and float(s) > 0:
+                    shares = float(s)
+            except (TypeError, ValueError, AttributeError):
+                pass
+        if shares is None:
+            for key in ("sharesOutstanding", "Shares Outstanding", "impliedSharesOutstanding", "Float Shares"):
+                s = info.get(key)
+                if s is not None and float(s) > 0:
+                    shares = float(s)
+                    break
+        if shares is None and balance is not None and not balance.empty:
+            try:
+                if "Share Issued" in balance.index:
+                    shares = _safe_float(balance.loc["Share Issued"].iloc[0])
+                if (shares is None or shares <= 0) and "Ordinary Shares Number" in balance.index:
+                    shares = _safe_float(balance.loc["Ordinary Shares Number"].iloc[0])
+            except (KeyError, TypeError, IndexError):
+                pass
+        out["shares"] = shares if (shares is not None and shares > 0) else None
+
+        # ----- Total Debt: fast_info → info → balance -----
+        total_debt = None
+        if fast_info is not None:
+            try:
+                d = getattr(fast_info, "total_debt", None) or (fast_info.get("total_debt") if hasattr(fast_info, "get") else None)
+                if d is not None and float(d) >= 0:
+                    total_debt = float(d)
+            except (TypeError, ValueError, AttributeError):
+                pass
+        if total_debt is None:
+            total_debt = info.get("Total Debt")
+        if total_debt is None and balance is not None and not balance.empty:
+            try:
+                if "Total Debt" in balance.index:
+                    total_debt = _safe_float(balance.loc["Total Debt"].iloc[0])
+            except (KeyError, TypeError, IndexError):
+                pass
+        out["total_debt"] = float(total_debt) if total_debt is not None else 0.0
+
+        # ----- Cash: fast_info → info → balance -----
+        cash = None
+        if fast_info is not None:
+            try:
+                c = getattr(fast_info, "cash", None) or (fast_info.get("cash") if hasattr(fast_info, "get") else None)
+                if c is not None and float(c) >= 0:
+                    cash = float(c)
+            except (TypeError, ValueError, AttributeError):
+                pass
+        if cash is None:
+            cash = info.get("Cash And Cash Equivalents") or info.get("Cash")
+        if cash is None and balance is not None and not balance.empty:
+            try:
+                for row in ("Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments", "Cash"):
+                    if row in balance.index:
+                        cash = _safe_float(balance.loc[row].iloc[0])
+                        if cash is not None:
+                            break
+            except (KeyError, TypeError, IndexError):
+                pass
+        out["cash"] = float(cash) if cash is not None else 0.0
+
+        # ----- Base FCF = OCF - CapEx -----
+        ocf = _get_row_series(cashflow, "Operating Cash Flow", "Cash From Operating Activities", "Cash From Operations") if cashflow is not None else None
+        capx = _get_row_series(cashflow, "Capital Expenditure", "Capital Expenditures", "Purchase Of Property Plant And Equipment") if cashflow is not None else None
+        if ocf is not None and len(ocf) > 0:
+            latest_date = ocf.index[0]
+            ocf_val = _safe_float(ocf.iloc[0])
+            capx_val = _safe_float(capx.get(latest_date)) if (capx is not None and hasattr(capx, "index") and latest_date in getattr(capx, "index", [])) else (_safe_float(capx.iloc[0]) if capx is not None and len(capx) > 0 else None)
+            if capx_val is None:
+                capx_val = 0.0
+            if ocf_val is not None:
+                latest_fcf = ocf_val - capx_val
+                if latest_fcf == latest_fcf and not (isinstance(latest_fcf, float) and pd.isna(latest_fcf)):
+                    out["fcf"] = latest_fcf
+        return out
     except Exception:
-        return {}
+        return out
 
 
 def dcf_intrinsic_value(fcf: float, wacc: float, terminal_growth: float, fcf_growth: float, years: int = 5) -> float:
-    """5-year DCF: project FCF with fcf_growth, then terminal value; discount at WACC. Returns enterprise value."""
-    if fcf <= 0 or wacc <= terminal_growth:
+    """5-year DCF: project FCF with fcf_growth, then terminal value; discount at WACC. Returns enterprise value. Robust: avoids div by zero."""
+    if fcf is None or fcf <= 0:
+        return 0.0
+    if wacc <= terminal_growth or wacc <= 0:
         return 0.0
     pv = 0.0
-    fcft = fcf
+    fcft = float(fcf)
     for t in range(1, years + 1):
         pv += fcft / ((1 + wacc) ** t)
         fcft *= (1 + fcf_growth)
@@ -548,10 +684,150 @@ def dcf_intrinsic_value(fcf: float, wacc: float, terminal_growth: float, fcf_gro
     return pv
 
 
+def dcf_10y_2stage(fcf: float, wacc: float, term_growth: float, fcf_growth: float) -> float:
+    """10-Year 2-Stage DCF. Stage 1 (Y1–5): FCF grows at fcf_growth. Stage 2 (Y6–10): growth linearly fades from fcf_growth to term_growth by Y10. TV at Y10; discount all to PV."""
+    if fcf is None or fcf <= 0:
+        return 0.0
+    if wacc <= term_growth or wacc <= 0:
+        return 0.0
+    pv = 0.0
+    fcft = float(fcf)
+    for t in range(1, 6):
+        pv += fcft / ((1 + wacc) ** t)
+        fcft *= (1 + fcf_growth)
+    for t in range(6, 11):
+        fade = (t - 6) / 4.0
+        g_t = fcf_growth + fade * (term_growth - fcf_growth)
+        fcft *= (1 + g_t)
+        pv += fcft / ((1 + wacc) ** t)
+    tv = fcft * (1 + term_growth) / (wacc - term_growth)
+    pv += tv / ((1 + wacc) ** 10)
+    return pv
+
+
+def excel_style_dcf(fcf_base: float, wacc: float, term_growth: float, fcf_growth: float, total_debt: float, cash: float, shares: float) -> dict:
+    """10Y 2-Stage DCF: EV = PV(FCF Y1–10) + PV(TV); Equity = EV - Debt + Cash; Value per share = Equity / Shares."""
+    ev = dcf_10y_2stage(fcf_base, wacc, term_growth, fcf_growth)
+    equity = ev - total_debt + cash
+    shares_safe = float(shares) if (shares is not None and float(shares) > 0) else None
+    value_per_share = (equity / shares_safe) if shares_safe else None
+    return {"ev": ev, "equity_value": equity, "value_per_share": value_per_share, "shares": shares_safe}
+
+
+# Aswath Damodaran sector WACC (approx. 2024/2025 baseline). Used for reference in DCF panel.
+DAMODARAN_WACC = {
+    "Software": 8.5,
+    "Retail": 7.5,
+    "Hardware": 9.0,
+    "Financials": 8.0,
+    "Healthcare": 7.2,
+    "Consumer": 7.5,
+    "Technology": 8.5,
+    "Industrial": 7.8,
+    "Energy": 8.2,
+    "Utilities": 6.5,
+}
+DAMODARAN_ERP_PCT = 4.6
+DAMODARAN_RF_PCT = 4.2
+
+
+def _damodaran_wacc_for_sector(sector: str) -> float:
+    """Map yfinance sector string to closest Damodaran WACC. Default 8.0%."""
+    if not sector:
+        return 8.0
+    s = (sector or "").lower()
+    if "software" in s or "technology" in s or "internet" in s:
+        return DAMODARAN_WACC.get("Software", 8.5)
+    if "hardware" in s or "semiconductor" in s:
+        return DAMODARAN_WACC.get("Hardware", 9.0)
+    if "retail" in s or "consumer" in s or "cyclical" in s:
+        return DAMODARAN_WACC.get("Retail", 7.5)
+    if "financial" in s or "bank" in s or "insurance" in s:
+        return DAMODARAN_WACC.get("Financials", 8.0)
+    if "health" in s or "pharma" in s:
+        return DAMODARAN_WACC.get("Healthcare", 7.2)
+    if "industrial" in s:
+        return DAMODARAN_WACC.get("Industrial", 7.8)
+    if "energy" in s or "oil" in s:
+        return DAMODARAN_WACC.get("Energy", 8.2)
+    if "utilities" in s:
+        return DAMODARAN_WACC.get("Utilities", 6.5)
+    return 8.0
+
+
+@st.cache_data(ttl=300)
+def get_analyst_consensus(ticker: str) -> dict:
+    """Fetch analyst consensus from yfinance: targetMeanPrice, recommendationKey, revenueGrowth, earningsGrowth. Missing → N/A."""
+    out = {"targetMeanPrice": "N/A", "recommendationKey": "N/A", "revenueGrowth": "N/A", "earningsGrowth": "N/A"}
+    if not yf or not ticker:
+        return out
+    try:
+        t = yf.Ticker(ticker.upper())
+        info = t.info or {}
+        tp = info.get("targetMeanPrice")
+        if tp is not None:
+            try:
+                out["targetMeanPrice"] = f"${float(tp):.2f}"
+            except (TypeError, ValueError):
+                out["targetMeanPrice"] = str(tp)
+        rec = info.get("recommendationKey") or info.get("recommendation")
+        if rec is not None:
+            out["recommendationKey"] = str(rec)
+        rg = info.get("revenueGrowth")
+        if rg is not None:
+            try:
+                out["revenueGrowth"] = f"{float(rg) * 100:.1f}%"
+            except (TypeError, ValueError):
+                out["revenueGrowth"] = str(rg)
+        eg = info.get("earningsGrowth")
+        if eg is not None:
+            try:
+                out["earningsGrowth"] = f"{float(eg) * 100:.1f}%"
+            except (TypeError, ValueError):
+                out["earningsGrowth"] = str(eg)
+        return out
+    except Exception:
+        return out
+
+
+@st.cache_data(ttl=300)
+def get_dcf_smart_defaults(ticker: str) -> dict:
+    """Smart default assumptions: WACC from CAPM (Beta), Terminal Growth = 2.5%, FCF Growth from revenueGrowth/earningsGrowth or 8%."""
+    out = {"wacc_pct": 10.0, "term_growth_pct": 2.5, "fcf_growth_pct": 8.0}
+    if not yf or not ticker:
+        return out
+    try:
+        t = yf.Ticker(ticker.upper())
+        info = t.info or {}
+        beta = info.get("beta")
+        if beta is None:
+            beta = 1.0
+        else:
+            try:
+                beta = float(beta)
+            except (TypeError, ValueError):
+                beta = 1.0
+        risk_free = 4.0
+        market_risk_premium = 5.0
+        calculated_wacc = risk_free + (beta * market_risk_premium)
+        out["wacc_pct"] = round(min(20.0, max(4.0, calculated_wacc)), 1)
+        out["term_growth_pct"] = 2.5
+        rev_growth = info.get("revenueGrowth") or info.get("earningsGrowth")
+        if rev_growth is not None:
+            try:
+                g = float(rev_growth)
+                out["fcf_growth_pct"] = round(min(30.0, max(-10.0, g * 100)), 1)
+            except (TypeError, ValueError):
+                pass
+        return out
+    except Exception:
+        return out
+
+
 # ---------- yfinance: Comps (multiples) ----------
 @st.cache_data(ttl=300)
 def get_comps_data(tickers: tuple) -> pd.DataFrame:
-    """Fetch Forward P/E, EV/EBITDA, P/B for each ticker. Returns styled DataFrame."""
+    """Fetch Forward P/E, EV/EBITDA, P/B using forwardPE, enterpriseToEbitda, priceToBook. Missing → None (display as N/A). Robust per-ticker error handling."""
     if not yf:
         return pd.DataFrame()
     rows = []
@@ -561,17 +837,19 @@ def get_comps_data(tickers: tuple) -> pd.DataFrame:
             continue
         try:
             t = yf.Ticker(sym)
-            info = t.info
-            forward_pe = info.get("Forward PE") or info.get("Trailing PE")
-            pb = info.get("Price To Book")
-            ev = info.get("Enterprise Value")
-            ebitda = info.get("EBITDA")
-            ev_ebitda = (ev / ebitda) if (ev is not None and ebitda is not None and ebitda != 0) else None
+            info = t.info or {}
+            forward_pe = info.get("forwardPE") or info.get("Forward PE") or info.get("trailingPE") or info.get("Trailing PE")
+            ev_ebitda = info.get("enterpriseToEbitda")
+            if ev_ebitda is None:
+                ev, ebitda = info.get("enterpriseValue"), info.get("ebitda")
+                if ev is not None and ebitda is not None and ebitda != 0:
+                    ev_ebitda = ev / ebitda
+            pb = info.get("priceToBook") or info.get("Price To Book")
             rows.append({
                 "Ticker": sym,
-                "Forward P/E": round(forward_pe, 2) if forward_pe is not None else None,
-                "EV/EBITDA": round(ev_ebitda, 2) if ev_ebitda is not None else None,
-                "P/B": round(pb, 2) if pb is not None else None,
+                "Forward P/E": round(float(forward_pe), 2) if forward_pe is not None and _safe_float(forward_pe) is not None else None,
+                "EV/EBITDA": round(float(ev_ebitda), 2) if ev_ebitda is not None and _safe_float(ev_ebitda) is not None else None,
+                "P/B": round(float(pb), 2) if pb is not None and _safe_float(pb) is not None else None,
             })
         except Exception:
             rows.append({"Ticker": sym, "Forward P/E": None, "EV/EBITDA": None, "P/B": None})
@@ -651,7 +929,11 @@ def get_dupont_altman_redflags_yoy(ticker: str) -> dict:
             cl = _v(current_liab, d)
             current_ratio = (ca / cl) if (ca and cl and cl != 0) else None
             int_exp = _v(interest, d)
-            interest_cov = (op_inc / int_exp) if (op_inc and int_exp and int_exp != 0) else None
+            if op_inc is not None and int_exp is not None and int_exp != 0:
+                _ic = op_inc / int_exp
+                interest_cov = round(_ic, 2) if (_ic == _ic and not (isinstance(_ic, float) and (pd.isna(_ic) or _ic != _ic))) else None
+            else:
+                interest_cov = None  # N/A when Interest Expense is 0 or missing (avoid nan%)
             rows.append({
                 "Year": yr,
                 "Revenue": r, "Net Income": net_i,
@@ -662,7 +944,7 @@ def get_dupont_altman_redflags_yoy(ticker: str) -> dict:
                 "Gross Margin %": round(gross_margin, 2) if gross_margin is not None else None,
                 "Operating Margin %": round(op_margin, 2) if op_margin is not None else None,
                 "Current Ratio": round(current_ratio, 2) if current_ratio is not None else None,
-                "Interest Coverage": round(interest_cov, 2) if interest_cov is not None else None,
+                "Interest Coverage": interest_cov,
             })
         dupont_df = pd.DataFrame(rows)
         yoy = []
@@ -672,12 +954,16 @@ def get_dupont_altman_redflags_yoy(ticker: str) -> dict:
                     continue
                 cur = dupont_df[col].iloc[0]
                 prev = dupont_df[col].iloc[1]
-                if cur is not None and prev is not None and prev != 0:
+                if cur is not None and prev is not None and prev != 0 and not (pd.isna(cur) or pd.isna(prev)):
                     if "Margin" in col or "NPM" in col or "ROE" in col:
                         chg_bps = (cur - prev) * 100  # bps for %
+                        if pd.isna(chg_bps) or chg_bps != chg_bps:
+                            continue
                         yoy.append({"Ratio": col, "Latest": cur, "Prior": prev, "YoY (bps)": round(chg_bps, 0), "Comment": f"{'Improved' if chg_bps > 0 else 'Declined'} by {abs(round(chg_bps))} bps YoY"})
                     else:
                         pct = (cur - prev) / abs(prev) * 100
+                        if pd.isna(pct) or pct != pct:
+                            continue
                         yoy.append({"Ratio": col, "Latest": cur, "Prior": prev, "YoY %": round(pct, 1), "Comment": f"{'Up' if pct > 0 else 'Down'} {abs(round(pct, 1))}% YoY"})
         latest_bal_d = bal.columns[0]
         wc = (_v(current_assets, latest_bal_d) or 0) - (_v(current_liab, latest_bal_d) or 0)
@@ -800,17 +1086,35 @@ st.caption("Hybrid: Gemini for qualitative (10-K MD&A & Risks); yfinance for qua
 
 with st.sidebar:
     st.header("Settings")
+    _prefs = _load_prefs()
+    _default_key = _prefs.get("google_api_key") or os.environ.get("GOOGLE_API_KEY", "")
+    _default_email = _prefs.get("sec_email") or os.environ.get("SEC_EDGAR_EMAIL", "")
     google_api_key = st.text_input(
         "Google API Key (Gemini)",
         type="password",
-        value=os.environ.get("GOOGLE_API_KEY", ""),
+        value=_default_key,
         help="Required for Tab 1 (10-K insights).",
+        key="input_google_api_key",
     )
     sec_email = st.text_input(
         "SEC EDGAR Email",
-        value=os.environ.get("SEC_EDGAR_EMAIL", ""),
+        value=_default_email,
         help="Required for 10-K download.",
+        key="input_sec_email",
     )
+    remember_me = st.checkbox(
+        "Remember API key & email (save locally)",
+        value=bool(_prefs),
+        help="Store in .app_prefs.json in this project. Uncheck to clear and stop saving.",
+        key="remember_me",
+    )
+    if remember_me and (google_api_key or sec_email):
+        _save_prefs(google_api_key, sec_email)
+    elif not remember_me and _PREFS_PATH.exists():
+        try:
+            _PREFS_PATH.unlink()
+        except Exception:
+            pass
     st.markdown("**Ticker / Company search**")
     search_term = st.text_input("Type ticker or company name", value="", key="ticker_search", placeholder="e.g. NVDA or NVIDIA")
     search_upper = (search_term or "").strip().upper()
@@ -862,7 +1166,9 @@ with tab1:
             if red_flags:
                 st.markdown("**Red flags**")
                 for rf in red_flags:
-                    st.warning(f"**{rf.get('flag', 'WARNING')}** — {rf.get('metric')}: {rf.get('value')} (threshold: {rf.get('threshold')}). {rf.get('comment', '')}")
+                    val = rf.get("value")
+                    val_str = "N/A" if (val is None or (isinstance(val, float) and (pd.isna(val) or val != val))) else val
+                    st.warning(f"**{rf.get('flag', 'WARNING')}** — {rf.get('metric')}: {val_str} (threshold: {rf.get('threshold')}). {rf.get('comment', '')}")
             elif dupont_df is not None and not dupont_df.empty:
                 st.success("No red flags triggered (Current Ratio ≥ 1.0, Interest Coverage ≥ 1.5).")
             sector_metrics = get_sector_specific_metrics(ticker, sector) if ticker else {}
@@ -971,96 +1277,165 @@ with tab2:
     elif ticker:
         st.caption("5-year trend not available for this ticker. DCF section below uses latest FCF from yfinance.")
     st.markdown("---")
-    st.markdown("#### DCF valuation: inputs & 3-scenario output")
-    dcf_inputs = get_dcf_inputs(ticker) if ticker else {}
-    if not dcf_inputs:
-        st.warning("Could not fetch DCF inputs from yfinance. Check ticker or try again.")
+    st.markdown("#### DCF valuation (Excel-style): inputs & 3-scenario output")
+    dcf_inputs = get_dcf_inputs(ticker) if ticker else {"fcf": None, "total_debt": 0.0, "cash": 0.0, "shares": None}
+    fcf_fetched = dcf_inputs.get("fcf")
+    total_debt = float(dcf_inputs.get("total_debt") or 0.0)
+    cash = float(dcf_inputs.get("cash") or 0.0)
+    shares_fetched = dcf_inputs.get("shares")
+    # Base FCF
+    if fcf_fetched is None or fcf_fetched <= 0:
+        fcf = st.number_input("Base FCF (manual — only if yfinance missing)", value=0.0, min_value=-1e12, step=1e8, format="%.0f", key="dcf_fcf_manual")
     else:
-        fcf = dcf_inputs.get("fcf") or 0
-        total_debt = dcf_inputs.get("total_debt") or 0
-        cash = dcf_inputs.get("cash") or 0
-        shares = dcf_inputs.get("shares")
-        if fcf and fcf > 0 and shares and shares > 0:
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                wacc = st.slider("WACC (%)", 4.0, 20.0, 10.0, 0.5) / 100.0
-            with col2:
-                term_growth = st.slider("Terminal Growth Rate (%)", -2.0, 6.0, 2.0, 0.25) / 100.0
-            with col3:
-                base_growth = st.slider("Base Case FCF Growth (%)", -10.0, 30.0, 8.0, 0.5) / 100.0
-            bull_growth = base_growth + 0.02
-            bear_growth = base_growth - 0.02
-            ev_base = dcf_intrinsic_value(fcf, wacc, term_growth, base_growth, years=5)
-            ev_bull = dcf_intrinsic_value(fcf, wacc, term_growth, bull_growth, years=5)
-            ev_bear = dcf_intrinsic_value(fcf, wacc, term_growth, bear_growth, years=5)
-            equity_base = ev_base - total_debt + cash
-            equity_bull = ev_bull - total_debt + cash
-            equity_bear = ev_bear - total_debt + cash
-            price_base = equity_base / shares if shares else 0
-            price_bull = equity_bull / shares if shares else 0
-            price_bear = equity_bear / shares if shares else 0
-            st.markdown("**Intrinsic value per share**")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Bull (+2% growth)", f"${price_bull:.2f}", f"+{(price_bull - price_base):.2f} vs Base")
-            c2.metric("Base", f"${price_base:.2f}", "—")
-            c3.metric("Bear (−2% growth)", f"${price_bear:.2f}", f"{(price_bear - price_base):.2f} vs Base")
-            df_dcf = pd.DataFrame({
-                "Scenario": ["Bull", "Base", "Bear"],
-                "FCF Growth": [f"{bull_growth*100:.1f}%", f"{base_growth*100:.1f}%", f"{bear_growth*100:.1f}%"],
-                "Intrinsic Value ($)": [round(price_bull, 2), round(price_base, 2), round(price_bear, 2)],
-            })
-            st.dataframe(df_dcf, use_container_width=True, hide_index=True)
-        else:
-            st.caption("FCF or Shares not available. FCF = OCF − CapEx from yfinance.")
+        fcf = float(fcf_fetched)
+        st.caption(f"Base FCF (OCF − CapEx): **${fcf/1e9:.2f}B**" if abs(fcf) >= 1e9 else f"Base FCF (OCF − CapEx): **${fcf/1e6:.0f}M**")
+    # Shares: auto-fetched (fast_info → info → balance); manual only as last resort
+    if shares_fetched is not None and shares_fetched > 0:
+        shares = float(shares_fetched)
+        st.caption(f"Shares Outstanding: **{_format_shares_display(shares)}** (real-time, auto-fetched)")
+    else:
+        shares = st.number_input("Shares Outstanding (manual — only if all API sources failed)", value=1e9, min_value=1.0, step=1e7, format="%.0f", key="dcf_shares_manual")
+    # Total Debt & Cash: manual only when both API sources completely failed
+    if total_debt == 0 and cash == 0:
+        c1, c2 = st.columns(2)
+        with c1:
+            total_debt = st.number_input("Total Debt (manual — only if all sources failed)", value=0.0, min_value=0.0, step=1e8, format="%.0f", key="dcf_debt_manual")
+        with c2:
+            cash = st.number_input("Cash & Equivalents (manual — only if all sources failed)", value=0.0, min_value=0.0, step=1e8, format="%.0f", key="dcf_cash_manual")
+    else:
+        st.caption(f"Total Debt: **${total_debt/1e9:.2f}B**" if total_debt >= 1e9 else f"Total Debt: **${total_debt/1e6:.0f}M**" if total_debt >= 1e6 else f"Total Debt: **${total_debt:,.0f}**")
+        st.caption(f"Cash & Equivalents: **${cash/1e9:.2f}B**" if cash >= 1e9 else f"Cash & Equivalents: **${cash/1e6:.0f}M**" if cash >= 1e6 else f"Cash & Equivalents: **${cash:,.0f}**")
+    dcf_defaults = get_dcf_smart_defaults(ticker) if ticker else {"wacc_pct": 10.0, "term_growth_pct": 2.5, "fcf_growth_pct": 8.0}
+    st.markdown("**Assumptions (sliders)**")
+    st.caption("💡 Slider defaults are auto-generated based on the company's Beta (CAPM) and revenue growth estimates.")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        wacc = st.slider("WACC (Discount Rate) %", 4.0, 20.0, float(dcf_defaults["wacc_pct"]), 0.5, key="dcf_wacc") / 100.0
+    with col2:
+        term_growth = st.slider("Terminal Growth Rate %", -2.0, 6.0, float(dcf_defaults["term_growth_pct"]), 0.25, key="dcf_term") / 100.0
+    with col3:
+        base_growth = st.slider("Projected FCF Growth (Stage 1, Y1–5) %", -10.0, 30.0, float(dcf_defaults["fcf_growth_pct"]), 0.5, key="dcf_fcf_growth") / 100.0
+    bull_growth = base_growth + 0.02
+    bear_growth = base_growth - 0.02
+    with st.expander("Reference: Analyst & Macro Assumptions", expanded=False):
+        left_col, right_col = st.columns(2)
+        with left_col:
+            st.markdown("**Analyst consensus (yfinance)**")
+            analyst = get_analyst_consensus(ticker) if ticker else {}
+            st.markdown(f"- **Target mean price:** {analyst.get('targetMeanPrice', 'N/A')}")
+            st.markdown(f"- **Recommendation:** {analyst.get('recommendationKey', 'N/A')}")
+            st.markdown(f"- **Revenue growth est.:** {analyst.get('revenueGrowth', 'N/A')}")
+            st.markdown(f"- **Earnings growth est.:** {analyst.get('earningsGrowth', 'N/A')}")
+        with right_col:
+            st.markdown("**Aswath Damodaran — macro baseline**")
+            sector_name = get_sector_industry(ticker).get("sector", "N/A") if ticker else "N/A"
+            damodaran_wacc = _damodaran_wacc_for_sector(sector_name) if ticker else 8.0
+            st.markdown(f"- **Sector WACC (ref.):** {damodaran_wacc:.1f}% (closest: {sector_name})")
+            st.markdown(f"- **US equity risk premium (ERP):** {DAMODARAN_ERP_PCT}%")
+            st.markdown(f"- **10Y risk-free rate:** {DAMODARAN_RF_PCT}%")
+            st.markdown("[Data & methodology (Damodaran)](https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/wacc.htm) so users can verify.")
+    res_base = excel_style_dcf(fcf, wacc, term_growth, base_growth, total_debt, cash, shares)
+    res_bull = excel_style_dcf(fcf, wacc, term_growth, bull_growth, total_debt, cash, shares)
+    res_bear = excel_style_dcf(fcf, wacc, term_growth, bear_growth, total_debt, cash, shares)
+    price_base = res_base.get("value_per_share") or 0.0
+    price_bull = res_bull.get("value_per_share") or 0.0
+    price_bear = res_bear.get("value_per_share") or 0.0
+    current_price = None
+    if ticker and yf:
+        try:
+            info = yf.Ticker(ticker.upper()).info or {}
+            current_price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+        except Exception:
+            pass
+    st.markdown("**Intrinsic value vs current price**")
+    if current_price is not None and current_price > 0:
+        st.metric("Current price", f"${current_price:.2f}", None)
+    st.metric("Base case intrinsic value per share", f"${price_base:.2f}" if price_base else "N/A", f"vs current: {(price_base - current_price):.2f}" if (current_price and price_base) else None)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Bull (+2% FCF growth)", f"${price_bull:.2f}" if price_bull else "N/A", f"vs Base: +{(price_bull - price_base):.2f}" if (price_bull and price_base) else None)
+    c2.metric("Base", f"${price_base:.2f}" if price_base else "N/A", "—")
+    c3.metric("Bear (−2% FCF growth)", f"${price_bear:.2f}" if price_bear else "N/A", f"vs Base: {(price_bear - price_base):.2f}" if (price_bear and price_base) else None)
+    df_dcf = pd.DataFrame({
+        "Scenario": ["Bull", "Base", "Bear"],
+        "FCF Growth %": [f"{bull_growth*100:.1f}", f"{base_growth*100:.1f}", f"{bear_growth*100:.1f}"],
+        "Intrinsic Value ($)": [round(price_bull, 2) if price_bull else "N/A", round(price_base, 2) if price_base else "N/A", round(price_bear, 2) if price_bear else "N/A"],
+    })
+    st.dataframe(df_dcf, use_container_width=True, hide_index=True)
 
-# ----- Tab 3: Industry Comps (conditional formatting) -----
+# ----- Tab 3: Top-Down Sector Analysis (Industry Comps + AI Outlook) -----
 with tab3:
-    st.subheader("Industry Analysis & Comps")
-    st.markdown("Enter **comma-separated competitor tickers**. Multiples from **yfinance**. Green = below peer average (undervalued), Red = above (overvalued).")
-    comp_tickers = st.text_input("Competitor tickers", value="AMD, INTC, QCOM", key="comps").strip()
-    if st.button("Load Comps", key="load_comps"):
-        tickers_list = [t.strip().upper() for t in comp_tickers.split(",") if t.strip()]
-        if ticker and ticker not in tickers_list:
-            tickers_list = [ticker] + tickers_list
-        if not tickers_list:
-            st.warning("Enter at least one ticker.")
-        else:
+    st.subheader("Top-Down Sector Analysis")
+    st.markdown("Select an **industry** to load peer multiples (Forward P/E, EV/EBITDA, P/B). Green = lowest (undervalued), Red = highest. Optionally generate an **AI Industry Outlook**.")
+    sector_options = list(SECTORS.keys())
+    selected_industry = st.selectbox("Select industry", sector_options, key="sector_select")
+    tickers_list = list(SECTORS.get(selected_industry, []))
+    if not tickers_list:
+        st.warning("No tickers defined for this industry.")
+    else:
+        with st.spinner("Fetching market data..."):
             df_comps = get_comps_data(tuple(tickers_list))
-            if df_comps.empty:
-                st.warning("Could not fetch comps from yfinance.")
-            else:
-                try:
-                    styled = df_comps.style
-                    for col in ["Forward P/E", "EV/EBITDA", "P/B"]:
-                        if col not in df_comps.columns:
-                            continue
-                        s = pd.to_numeric(df_comps[col], errors="coerce")
-                        avg = s.mean()
-                        if pd.isna(avg):
-                            continue
-                        def color_fn(v, avg_val=avg):
-                            if pd.isna(v):
-                                return ""
-                            try:
-                                x = float(v)
-                            except (TypeError, ValueError):
-                                return ""
-                            if x < avg_val:
-                                return "background-color: rgba(0, 200, 83, 0.3); color: #0d5c2e"
-                            if x > avg_val:
-                                return "background-color: rgba(255, 82, 82, 0.3); color: #b71c1c"
+        if df_comps.empty:
+            st.warning("Could not fetch comps from yfinance. One or more tickers may have failed; try again later.")
+        else:
+            df_display = df_comps.copy()
+            for col in ["Forward P/E", "EV/EBITDA", "P/B"]:
+                if col not in df_display.columns:
+                    continue
+                df_display[col] = df_display[col].apply(
+                    lambda x: "N/A" if (x is None or (isinstance(x, float) and pd.isna(x))) else x
+                )
+            try:
+                styled = df_comps.style
+                for col in ["Forward P/E", "EV/EBITDA", "P/B"]:
+                    if col not in df_comps.columns:
+                        continue
+                    s = pd.to_numeric(df_comps[col], errors="coerce")
+                    valid = s.dropna()
+                    if len(valid) < 2:
+                        continue
+                    lo, hi = valid.min(), valid.max()
+                    if lo == hi:
+                        continue
+                    def color_fn(v, lo_val=lo, hi_val=hi):
+                        if pd.isna(v):
                             return ""
-                        styled = styled.map(lambda v: color_fn(v), subset=[col])
-                    st.dataframe(styled, use_container_width=True, hide_index=True)
-                except Exception:
-                    st.dataframe(df_comps, use_container_width=True, hide_index=True)
+                        try:
+                            x = float(v)
+                        except (TypeError, ValueError):
+                            return ""
+                        if x <= lo_val:
+                            return "background-color: rgba(0, 200, 83, 0.35); color: #0d5c2e"
+                        if x >= hi_val:
+                            return "background-color: rgba(255, 82, 82, 0.35); color: #b71c1c"
+                        return ""
+                    styled = styled.map(color_fn, subset=[col])
+                styled = styled.format(subset=["Forward P/E", "EV/EBITDA", "P/B"], formatter=lambda x: "N/A" if (pd.isna(x) or x is None) else f"{x:.2f}")
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+            except Exception:
+                st.dataframe(df_display, use_container_width=True, hide_index=True)
+        st.caption("Lowest multiple in each column = green (relatively undervalued); highest = red.")
 
-st.divider()
-with st.expander("S&P 500 sample — Company & Ticker"):
-    SP500_SAMPLE = [
-        ("NVIDIA Corporation", "NVDA"), ("Apple Inc.", "AAPL"), ("Microsoft Corporation", "MSFT"),
-        ("Amazon.com Inc.", "AMZN"), ("Alphabet Inc. (Google)", "GOOGL"), ("Meta Platforms Inc.", "META"),
-        ("AMD", "AMD"), ("Intel Corporation", "INTC"), ("Qualcomm Inc.", "QCOM"),
-    ]
-    df_sp = pd.DataFrame(SP500_SAMPLE, columns=["Company", "Ticker"])
-    st.dataframe(df_sp, use_container_width=True, hide_index=True)
+    st.markdown("---")
+    st.markdown("#### AI Industry Outlook")
+    if st.button("Generate Industry Outlook", key="industry_outlook_btn"):
+        if not tickers_list:
+            st.error("Select an industry above first.")
+        elif not st.session_state.get("google_api_key"):
+            st.error("Enter your Google API Key in the sidebar.")
+        else:
+            try:
+                with st.spinner("Generating industry outlook with Gemini..."):
+                    report = get_industry_outlook(
+                        st.session_state["google_api_key"],
+                        selected_industry,
+                        tickers_list,
+                    )
+                st.success("Done.")
+                st.markdown(report)
+            except RuntimeError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error("Failed to generate outlook. See details below.")
+                with st.expander("Error details"):
+                    st.code(repr(e), language="text")
+
