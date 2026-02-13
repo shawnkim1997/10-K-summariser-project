@@ -134,10 +134,12 @@ Open the sidebar to set **Google API Key** and **SEC EDGAR Email**, then use the
 
 Updates are listed in **reverse chronological order (newest first)**.
 
-| Date | Updates |
-|------|---------|
-| **2025-02-12** | **Hybrid architecture:** Send only Item 7 (MD&A) to Gemini; fetch financial metrics from **yfinance**. Add **HTML cleansing** (strip tags, collapse whitespace, remove page numbers). Change prompt to focus on management strategy, risks, and **sentiment** analysis. Add **find_toc.py** (SEC EDGAR HTML URL → Table of Contents extraction). Overhaul README for hybrid flow, Tech Stack, and Technical Challenge. |
-| **2025-02-12** | Add **Update history (Changelog)** to README and include `find_toc.py` in Project Structure. |
+| Date (UTC) | Updates |
+|------------|---------|
+| **2025-02-12 15:30** | **Dynamic Sector-Specific Analysis:** (1) **DuPont display:** Replace None/NaN with "N/A" in the table so missing rows (e.g. SBUX) do not break the layout. (2) **Sector & industry badge:** Auto-detect from `ticker.info` (sector/industry) and show Sector · Industry caption at top of Tab 1. (3) **Sector-specific metrics:** Technology (Rule of 40, FCF margin, R&D % of revenue), Retail/Consumer (inventory turnover, operating margin), Financials (ROE, ROA) — Tab 1 "Sector-specific metrics" block. (4) **Tab 2:** For Financial sector, add caption that FCF/EBITDA are less relevant and to refer to ROE/ROA in Tab 1. (5) **Gemini MD&A:** Add sector/industry args to `get_mda_comparative_insights`; prompt instructs extraction of industry-specific Non-GAAP KPIs (Same-Store Sales, ARR/NDR, DAU/MAU, etc.) in a markdown table. |
+| **2025-02-12 11:00** | **Data robustness & TTM fallback:** (1) yfinance **KeyError/NaN handling:** `_get_row_series` with try/except for financial/balance-sheet row access; `_na(x)` for consistent "N/A" display. (2) **TTM fallback:** When annual `financials`/`balance_sheet` are missing or empty, use sum of first 4 quarters from `quarterly_financials` and latest quarter from `quarterly_balance_sheet` for DuPont/Altman. (3) **`get_sector_industry(ticker)`** added (cached sector/industry). (4) `get_dupont_altman_redflags_yoy` returns empty dict on exception; stronger column/date checks when building TTM. |
+| **2025-02-12 09:00** | **Hybrid architecture:** Send only Item 7 (MD&A) to Gemini; fetch financial metrics from **yfinance**. Add **HTML cleansing** (strip tags, collapse whitespace, remove page numbers). Change prompt to focus on management strategy, risks, and **sentiment** analysis. Add **find_toc.py** (SEC EDGAR HTML URL → Table of Contents extraction). Overhaul README for hybrid flow, Tech Stack, and Technical Challenge. |
+| **2025-02-12 08:45** | Add **Update history (Changelog)** to README and include `find_toc.py` in Project Structure. |
 | **2025-02-01** (approx.) | Selective extraction: send only Item 7 & 8 to the API. 429 handling: retry with 60s wait, "Analysis only" option, timeout/404/error messages. Switch to Google **Gemini** and add `GOOGLE_API_KEY` (.env and sidebar). CFA Investment Report, metrics table, two-step spinners. |
 | **2025-01-XX** (approx.) | Initial release: SEC EDGAR 10-K download, Item 7 & 8 extraction, LLM analysis, Streamlit UI. S&P 500 sample list (company name and ticker). |
 
