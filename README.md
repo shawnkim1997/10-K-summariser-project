@@ -18,7 +18,7 @@ The app is organised into **three tabs:**
 - **Tab 2 — DCF:** 10-year 2-stage model (5-year growth + 5-year fade to terminal rate). Base FCF = OCF − CapEx; shares/debt/cash from yfinance with robust fallbacks; manual inputs only as last resort. Smart slider defaults (Beta/CAPM WACC, 2.5% terminal, revenue/earnings growth). Reference panel: analyst consensus (target price, recommendation, revenue/earnings growth) and Damodaran sector WACC, ERP, 10Y risk-free rate with methodology link.
 - **Tab 3 — Sector Analysis:** Predefined sectors with top 5 tickers each; comps table with N/A for missing multiples; green/red formatting; AI Industry Outlook (Gemini) for macro trends and risks.
 - **Error handling:** Try/except for SEC EDGAR, yfinance, and Gemini; clear messages and optional manual overrides so the app keeps running.
-- **UI:** Three-tab layout, sidebar (API key, SEC email, company/ticker search), optional "Remember API key & email" (local prefs file).
+- **UI:** Three-tab layout, sidebar (API key, SEC email, **global company search** via yahooquery—search by name in any language, e.g. Apple, 삼성, Mitsubishi), optional "Remember API key & email" (local prefs file). **Quantitative charts** (Sankey, Radar, F-Score) can use SEC 10-K Item 8 + Gemini extraction (US) or yahooquery/yfinance (global tickers with auto suffix).
 
 **Run time:** Tab 1 ≈ 1–2 min (one Gemini call); Tabs 2–3 use yfinance (seconds). Rate limit: 60s retry.
 
@@ -64,9 +64,9 @@ The **ultimate goal** is to launch this as a **fully commercialised B2C/B2B SaaS
 ## Tech Stack
 
 - **UI**: Streamlit  
-- **Data**: sec-edgar-downloader (SEC EDGAR), **yfinance** (financial metrics)  
+- **Data**: sec-edgar-downloader (SEC EDGAR), **yahooquery** (search + fundamentals), **yfinance** (fallback)  
 - **AI**: Google Gemini (google-generativeai)  
-- **Parsing / cleansing**: BeautifulSoup, regex  
+- **Parsing / cleansing**: BeautifulSoup, lxml, regex  
 
 ---
 
@@ -104,8 +104,9 @@ For full technical notes and code references, see **[TECHNICAL_NOTES.md](./TECHN
 
 **1. Go to the project folder**
 ```bash
-cd "/Users/seonpil/Documents/FQDC Project"
+cd "/path/to/your/FQDC Project"
 ```
+*(Replace with your actual project path.)*
 
 **2. Activate the virtual environment** (required so `pip` and `streamlit` are found)
 - **Mac / Linux:**
@@ -157,6 +158,7 @@ Updates are listed in **reverse chronological order (newest first)**. Each row s
 
 | Date (UTC) | Updates |
 |------------|---------|
+| **2025-02-14** | **Global company search & README:** Sidebar company search replaced with yahooquery `search()`: type company name (e.g. Samsung, 삼성, Mitsubishi), click "Search Company", select from dropdown `[Exchange] Symbol - Name`. Filter: EQUITY/ETF only (exclude INDEX/MUTUALFUND). Market suffix inferred from symbol (.KS/.KQ, .T, .L). README: Tech Stack (yahooquery, lxml), Features (global search, Item 8 quant), run/push instructions path-agnostic. |
 | **2025-02-13** | **Design Rationale & README:** New section "Design Rationale & Interview Notes" (undergrad automation mindset, 10y DCF rationale, Damodaran integration, consensus-panel rationale, commercialization). README Features and tab table updated to reflect 10Y 2-stage DCF, sector analysis, and Wall Street Assumptions panel. Changelog expanded with more detailed entries. |
 | **2025-02-13** | **Institutional DCF & Wall Street panel:** (1) **10-year 2-stage DCF:** Stage 1 (Y1–5) at user FCF growth; Stage 2 (Y6–10) linear fade from that rate to terminal growth (avoids absurd valuations for high-growth stocks). TV at Year 10; all FCFs + TV discounted to PV. (2) **Wall Street Assumptions panel** (expander below sliders): **Left column** — Analyst consensus from yfinance: target mean price, recommendation, revenue growth est., earnings growth est. (N/A if missing). **Right column** — Damodaran macro baseline: sector WACC map (Software 8.5%, Retail 7.5%, Hardware 9.0%, Financials 8.0%, etc.), US ERP ~4.6%, 10Y risk-free ~4.2%, plus markdown link to his WACC data page for methodology. Company sector matched via `get_sector_industry` for Damodaran WACC. |
 | **2025-02-13** | **Smart DCF defaults:** Slider defaults no longer hardcoded. **WACC:** CAPM approximation using `ticker.info.get('beta')` (default 1.0), Risk-free 4%, MRP 5%; default WACC = 4 + Beta×5, rounded to 1 decimal. **Terminal growth:** Fixed at 2.5% (Damodaran-style, long-term US GDP). **FCF growth:** From `revenueGrowth` or `earningsGrowth` (e.g. 0.15 → 15%); fallback 8%. Caption above sliders: "Slider defaults are auto-generated based on the company's Beta (CAPM) and revenue growth estimates." |
@@ -175,17 +177,17 @@ Updates are listed in **reverse chronological order (newest first)**. Each row s
 
 ## Push to GitHub
 
-From the project folder, commit and push (run these in your own terminal so authentication works):
+From the project folder, commit and push (run in your terminal so authentication works):
 
 ```bash
-cd "/Users/seonpil/Documents/FQDC Project"
-git add README.md app.py
+cd "/path/to/your/FQDC Project"
+git add README.md app.py requirements.txt
 git status
-git commit -m "README: Design Rationale, detailed changelog, institutional DCF notes"
+git commit -m "README: global search, Item 8 quant, yahooquery; update run instructions"
 git push origin main
 ```
 
-If you use another branch or remote name, replace `main` or `origin` accordingly. If the repo is not yet initialised: `git init`, then `git remote add origin <your-repo-url>` before pushing.
+If you use another branch or remote: replace `main` or `origin`. New repo: `git init`, then `git remote add origin <your-repo-url>`.
 
 ---
 

@@ -10,16 +10,20 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
+
 
 # Local prefs file for "Remember me" (API key & email). Path is in .gitignore.
 _PREFS_PATH = Path(__file__).resolve().parent / ".app_prefs.json"
+# Persistent 10-K cache: data/ticker_latest.json (Item 1A, 3, 7, 9A cleaned text).
+_DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
 def _load_prefs() -> dict:
-    """Load saved API key and email from local file. Keys: google_api_key, sec_email."""
+    """Load saved API keys and email from local file. Keys: google_api_key, sec_email."""
     try:
         if _PREFS_PATH.exists():
             with open(_PREFS_PATH, "r", encoding="utf-8") as f:
@@ -30,10 +34,14 @@ def _load_prefs() -> dict:
 
 
 def _save_prefs(google_api_key: str, sec_email: str) -> None:
-    """Save API key and email to local file (only if user opted in)."""
+    """Save API keys and email to local file (only if user opted in)."""
     try:
+        data = {
+            "google_api_key": (google_api_key or "").strip(),
+            "sec_email": (sec_email or "").strip(),
+        }
         with open(_PREFS_PATH, "w", encoding="utf-8") as f:
-            json.dump({"google_api_key": (google_api_key or "").strip(), "sec_email": (sec_email or "").strip()}, f, indent=2)
+            json.dump(data, f, indent=2)
     except Exception:
         pass
 
@@ -43,8 +51,10 @@ from bs4 import BeautifulSoup
 
 try:
     import plotly.express as px
+    import plotly.graph_objects as go
 except ImportError:
     px = None
+    go = None
 
 try:
     from dotenv import load_dotenv
@@ -56,6 +66,13 @@ try:
     import yfinance as yf
 except ImportError:
     yf = None
+
+try:
+    from yahooquery import Ticker as YQTicker
+    from yahooquery import search as yq_search
+except ImportError:
+    YQTicker = None
+    yq_search = None
 
 # Company name → ticker for search/autocomplete (expand as needed)
 COMPANY_LIST = [
@@ -74,6 +91,47 @@ COMPANY_LIST = [
 COMPANY_OPTIONS = [f"{t} - {n}" for n, t in COMPANY_LIST]
 COMPANY_TICKER_MAP = {t: n for n, t in COMPANY_LIST}
 
+MARKET_OPTIONS = [
+    "US (S&P/Dow/Nasdaq)",
+    "South Korea (KOSPI/KOSDAQ)",
+    "Japan (Nikkei)",
+    "UK (LSE)",
+]
+
+
+def get_global_ticker(ticker: str, market: str) -> str:
+    """Format ticker for Yahoo Finance by market. US: as-is. South Korea: .KS or .KQ. Japan: .T. UK: .L. If ticker already has suffix, return as-is."""
+    if not (ticker or "").strip():
+        return (ticker or "").strip()
+    t = (ticker or "").strip()
+    if t.upper().endswith((".KS", ".KQ", ".T", ".L")):
+        return t
+    m = (market or "").strip()
+    if "US" in m or not m:
+        return t
+    if "Korea" in m or "KOSPI" in m or "KOSDAQ" in m:
+        return t + ".KS"
+    if "Japan" in m or "Nikkei" in m:
+        return t + ".T"
+    if "UK" in m or "LSE" in m:
+        return t + ".L"
+    return t
+
+
+def infer_market_from_ticker(ticker: str) -> str:
+    """Infer market label from ticker suffix (for Deep-Dive routing when no Market selector)."""
+    if not (ticker or "").strip():
+        return MARKET_OPTIONS[0]
+    t = (ticker or "").strip().upper()
+    if t.endswith(".KS") or t.endswith(".KQ"):
+        return "South Korea (KOSPI/KOSDAQ)"
+    if t.endswith(".T"):
+        return "Japan (Nikkei)"
+    if t.endswith(".L"):
+        return "UK (LSE)"
+    return "US (S&P/Dow/Nasdaq)"
+
+
 # Top-down sector analysis: industry → top 5 S&P 500 / NASDAQ tickers
 SECTORS = {
     "Semiconductors & Hardware": ["NVDA", "AMD", "INTC", "TSM", "AVGO"],
@@ -89,16 +147,49 @@ def get_edgar_downloader():
     return Downloader
 
 
+def _slice_html_items_1a_to_9a(raw_html: str) -> str:
+    """Fast string slice: keep only Item 1A through end of Item 9A to avoid parsing 50MB+ full file. Uses .find()/regex on raw string only."""
+    if not raw_html or len(raw_html) < 5000:
+        return raw_html
+    start = -1
+    for needle in ("Item 1A", "ITEM 1A", "Item 1a"):
+        i = raw_html.find(needle)
+        if i != -1 and (start == -1 or i < start):
+            start = i
+    if start == -1:
+        m = re.search(r"Item\s+1A\s", raw_html, re.IGNORECASE)
+        start = m.start() if m else 0
+    else:
+        start = max(0, start - 200)
+    search_region = raw_html[start:]
+    end_match = re.search(r"Item\s+10\s|Item\s+12\s|Part\s+III\b|PART\s+III\b", search_region, re.IGNORECASE)
+    end = start + end_match.start() if end_match else len(raw_html)
+    end = min(end, start + 8_000_000)
+    return raw_html[start:end]
+
+
+def _extract_text_from_html_string(html_str: str) -> str:
+    """Parse HTML string with lxml; drop table/img/svg/style/script immediately to reduce memory and speed."""
+    if not html_str or not html_str.strip():
+        return ""
+    try:
+        soup = BeautifulSoup(html_str, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html_str, "html.parser")
+    for tag in soup.find_all(["table", "img", "svg", "style", "script"]):
+        tag.decompose()
+    return soup.get_text(separator="\n", strip=True)
+
+
 def extract_text_from_html(html_path: Path) -> str:
     try:
         with open(html_path, "r", encoding="utf-8", errors="replace") as f:
-            soup = BeautifulSoup(f.read(), "lxml")
+            raw = f.read()
     except Exception:
         with open(html_path, "r", encoding="latin-1", errors="replace") as f:
-            soup = BeautifulSoup(f.read(), "lxml")
-    for tag in soup(["script", "style"]):
-        tag.decompose()
-    return soup.get_text(separator="\n", strip=True)
+            raw = f.read()
+    chunk = _slice_html_items_1a_to_9a(raw)
+    return _extract_text_from_html_string(chunk)
 
 
 def extract_text_from_file(file_path: Path) -> str:
@@ -127,6 +218,15 @@ ITEM7_PATTERNS = [
 ITEM8_PATTERNS = [
     r"Item\s+8\s*[.:]\s*Financial\s+Statements",
     r"ITEM\s+8\s*[.:]\s*Financial\s+Statements",
+]
+ITEM3_PATTERNS = [
+    r"Item\s+3\s*[.:]\s*Legal\s+Proceedings",
+    r"ITEM\s+3\s*[.:]\s*Legal\s+Proceedings",
+]
+ITEM9A_PATTERNS = [
+    r"Item\s+9A\s*[.:]\s*Controls\s+and\s+Procedures",
+    r"Item\s+9A\s*[.:]\s*Internal\s+Control",
+    r"ITEM\s+9A\s*[.:]\s*Controls",
 ]
 
 
@@ -158,35 +258,43 @@ def find_item_section_generic(text: str, patterns: list, item_num: int, title_ke
     return text[start:end].strip()
 
 
-def clean_text_for_llm(text: str) -> str:
-    if not text or not text.strip():
+def clean_text_for_llm(html_content: str) -> str:
+    """Aggressive cleaning for LLM: strip tables/code, collapse whitespace, drop non-ASCII. Uses lxml for speed; drops table/img/svg/style/script."""
+    if not html_content or not html_content.strip():
         return ""
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\r\n?", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    try:
+        soup = BeautifulSoup(html_content, "lxml")
+        for tag in soup.find_all(["table", "img", "style", "script", "svg", "math"]):
+            tag.decompose()
+        text = soup.get_text(separator=" ")
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", html_content)
+    text = re.sub(r"\s+", " ", text)
+    text = " ".join(text.split())
+    text = re.sub(r"[^\x20-\x7E\n]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
     lines = []
     for line in text.split("\n"):
         line = line.strip()
         if not line:
-            lines.append("")
             continue
         if re.fullmatch(r"\d+", line) or re.fullmatch(r"[\.\-\s\-]+", line):
             continue
         if re.match(r"^(page\s+\d+|\d+)\s*$", line, re.IGNORECASE) and len(line) < 20:
             continue
         lines.append(line)
-    result = "\n".join(lines)
-    result = re.sub(r"\n{3,}", "\n\n", result)
-    return result.strip()
+    result = " ".join(lines)
+    result = re.sub(r"\s+", " ", result).strip()
+    return result
 
 
-def smart_chunk(section: str, max_chars: int = 20000, head_ratio: float = 0.5) -> str:
-    if len(section) <= max_chars:
+def smart_chunk(section: str, max_chars: int = 10000, head_ratio: float = 0.5) -> str:
+    """Limit payload for Gemini; 10k chars ≈ 2.5k tokens for fast response."""
+    if not section or len(section) <= max_chars:
         return section
     head_size = int(max_chars * head_ratio)
     tail_size = max_chars - head_size - 100
-    return section[:head_size] + "\n\n[ ... middle omitted ... ]\n\n" + section[-tail_size:]
+    return section[:head_size] + " [ ... middle omitted ... ] " + section[-tail_size:]
 
 
 def find_downloaded_10k_path(download_root: Path, ticker: str) -> Optional[Path]:
@@ -238,8 +346,48 @@ def get_main_10k_text(filing_dir: Path) -> str:
     return main_text
 
 
-def download_and_extract_item7_and_1a(ticker: str, email: str) -> tuple[str, str, str]:
-    """Fetch 10-K from SEC EDGAR and return full_text, Item 1A (Risk Factors), Item 7 (MD&A)."""
+def _get_10k_cache_path(ticker: str) -> Path:
+    """Path for cached 10-K sections: data/TICKER_latest.json."""
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return _DATA_DIR / f"{ticker.upper()}_latest.json"
+
+
+def _load_10k_from_cache(ticker: str) -> Optional[dict]:
+    """Load Item 1A, 3, 7, 8, 9A (plain text) from data/ticker_latest.json. Returns None if missing. When present, no re-download or re-parse."""
+    path = _get_10k_cache_path(ticker)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_10k_to_cache(ticker: str, data: dict) -> None:
+    """Save cleaned 10-K sections to data/ticker_latest.json."""
+    path = _get_10k_cache_path(ticker)
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=0)
+
+
+def _extract_item_from_full(text: str, patterns: list, item_num: int, keywords: list, max_chars: int = 60000) -> str:
+    """Extract one item section from full 10-K text."""
+    start = _find_section_start(text, patterns, item_num)
+    if start < 0:
+        pattern = re.compile(r"\bItem\s+" + str(item_num) + r"[A-Z]?\b[.\s]*[^\n]*", re.IGNORECASE)
+        match = pattern.search(text)
+        start = match.start() if match else -1
+    if start < 0:
+        return ""
+    next_item = re.search(r"\n\s*Item\s+\d+[A-Z]?\s+", text[start + 100:], re.IGNORECASE)
+    end = start + 100 + next_item.start() if next_item else min(start + max_chars, len(text))
+    return text[start:end].strip()
+
+
+def download_and_extract_all_items(ticker: str, email: str) -> dict:
+    """Download latest 10-K, extract Item 1A, 3, 7, 9A; clean and return (and optionally cache)."""
     Downloader = get_edgar_downloader()
     with tempfile.TemporaryDirectory() as tmpdir:
         download_root = Path(tmpdir)
@@ -247,23 +395,42 @@ def download_and_extract_item7_and_1a(ticker: str, email: str) -> tuple[str, str
         dl.get("10-K", ticker.upper(), limit=1, download_details=True)
         filing_dir = find_downloaded_10k_path(download_root, ticker)
         if not filing_dir:
-            raise FileNotFoundError(f"Could not find 10-K for ticker '{ticker}'. Check ticker and SEC EDGAR.")
+            raise FileNotFoundError(f"Could not find 10-K for ticker '{ticker}'.")
         full_text = get_main_10k_text(filing_dir)
         if not full_text:
             raise ValueError("Could not extract text from the 10-K.")
-    item1a = find_item_section_generic(
-        full_text, ITEM1A_PATTERNS, 1, ["Risk", "Factors"], max_chars=80000
-    )
-    text_after_7 = full_text
+    item1a = find_item_section_generic(full_text, ITEM1A_PATTERNS, 1, ["Risk", "Factors"], max_chars=80000)
+    item3 = _extract_item_from_full(full_text, ITEM3_PATTERNS, 3, ["Legal", "Proceedings"], max_chars=40000)
+    item9a = _extract_item_from_full(full_text, ITEM9A_PATTERNS, 9, ["Controls", "Procedures", "Internal"], max_chars=40000)
     start7 = _find_section_start(full_text, ITEM7_PATTERNS, 7)
-    if start7 >= 0:
-        text_after_7 = full_text[start7:]
-    item7 = find_item_section_generic(
-        text_after_7, ITEM7_PATTERNS, 7, ["Management's Discussion", "MD&A", "Analysis"], max_chars=100000
-    )
+    text_after_7 = full_text[start7:] if start7 >= 0 else full_text
+    item7 = find_item_section_generic(text_after_7, ITEM7_PATTERNS, 7, ["Management's Discussion", "MD&A", "Analysis"], max_chars=100000)
     if not item7 and text_after_7:
-        item7 = smart_chunk(text_after_7[:120000], max_chars=20000)
-    return full_text, item1a, item7
+        item7 = text_after_7[:120000]
+    item8 = _extract_item_from_full(full_text, ITEM8_PATTERNS, 8, ["Financial Statements", "Supplementary Data"], max_chars=200000)
+    data = {
+        "item1a": clean_text_for_llm(item1a or ""),
+        "item3": clean_text_for_llm(item3 or ""),
+        "item9a": clean_text_for_llm(item9a or ""),
+        "item7": clean_text_for_llm(item7 or ""),
+        "item8": clean_text_for_llm(item8 or ""),
+    }
+    _save_10k_to_cache(ticker, data)
+    return data
+
+
+def get_10k_sections(ticker: str, email: str) -> tuple[dict, str]:
+    """Return (sections dict, status). status = 'cache' if loaded from file else 'downloaded'. Cached ticker skips download and parsing entirely (item1a, item3, item7, item8, item9a)."""
+    cached = _load_10k_from_cache(ticker)
+    if cached is not None:
+        return cached, "cache"
+    return download_and_extract_all_items(ticker, email), "downloaded"
+
+
+def download_and_extract_item7_and_1a(ticker: str, email: str) -> tuple[str, str, str]:
+    """Fetch 10-K from SEC EDGAR and return full_text, Item 1A (Risk Factors), Item 7 (MD&A). Uses cache when available."""
+    sections, _ = get_10k_sections(ticker, email)
+    return "", sections.get("item1a", "") or "", sections.get("item7", "") or ""
 
 
 def download_item7_latest_and_3y_ago(ticker: str, email: str) -> tuple[Optional[str], Optional[str], Optional[str], bool]:
@@ -334,6 +501,283 @@ def _generate_with_retry(model, content, config, max_retries: int = 3):
     raise last_err
 
 
+def _generate_stream(model, content, config):
+    """Yield text chunks from Gemini with stream=True. For use with st.write_stream()."""
+    try:
+        response = model.generate_content(content, generation_config=config, stream=True)
+        for chunk in response:
+            if hasattr(chunk, "text") and chunk.text:
+                yield chunk.text
+    except Exception:
+        raise
+
+
+def _split_into_chunks(text: str, max_chars: int = 22000, min_chunk: int = 5000) -> list:
+    """Split text into sequential chunks without cutting mid-sentence when possible."""
+    if not text or len(text) <= max_chars:
+        return [text] if text and text.strip() else []
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        if end < len(text):
+            break_at = text.rfind("\n\n", start, end + 1)
+            if break_at > start + min_chunk:
+                end = break_at + 2
+        chunks.append(text[start:end].strip())
+        start = end
+    return [c for c in chunks if c]
+
+
+def _gemini_summarize_segment(api_key: str, segment_text: str, ticker: str, segment_label: str) -> str:
+    """Extract strategic shifts and hidden risks from one segment. No trimming."""
+    model = get_gemini_model(api_key)
+    prompt = f"""You are a senior equity analyst. The following is one segment of the 10-K for {ticker} (Item 1A Risk Factors and/or Item 7 MD&A).
+Extract and list all significant: (1) strategic shifts or priorities, (2) hidden or material risks, (3) management tone cues. Use concise bullet points. Do not omit important details. Segment: {segment_label}."""
+    full = f"""--- 10-K Segment ---\n\n{segment_text[:50000]}\n\n---\n\n{prompt}"""
+    try:
+        r = _generate_with_retry(model, full, {"temperature": 0.2, "max_output_tokens": 2048})
+        return (r.text or "").strip()
+    except Exception:
+        return ""
+
+
+def _gemini_synthesize_report(api_key: str, segment_summaries: list, ticker: str, sector: str, industry: str) -> str:
+    """Synthesis call: turn segment summaries into Executive Insight Report."""
+    model = get_gemini_model(api_key)
+    combined = "\n\n---\n\n".join(segment_summaries)
+    kpi_note = f" Sector: {sector}; Industry: {industry}. Include industry-specific KPIs if mentioned." if sector and sector != "N/A" else ""
+    prompt = f"""You are a senior equity analyst. Use British English. Below are summarized insights from the full 10-K for {ticker} (Item 1A and Item 7). Create the final **Executive Insight Report** with these sections:
+
+1. **Management's Tone (Sentiment)**: Overall tone and supporting evidence.
+2. **Current Strategy & Priorities**: Key strategic focus, capital allocation, growth drivers.
+3. **Major Hidden Risks**: The 3–4 most material risks investors might overlook.
+4. **Forensic / Quality of Earnings**: Accounting caveats, one-offs, cash flow vs earnings. If none material, say so briefly.{kpi_note}
+
+Use clear headings. Do not invent figures. Keep under 900 words."""
+    full = f"""--- Segment Summaries ---\n\n{combined}\n\n---\n\n{prompt}"""
+    try:
+        r = _generate_with_retry(model, full, {"temperature": 0.3, "max_output_tokens": 4096})
+        return (r.text or "").strip()
+    except Exception:
+        return ""
+
+
+def _gemini_forensic_audit(api_key: str, item3: str, item9a: str, ticker: str) -> str:
+    """Dedicated high-priority check: Material Weaknesses, lawsuits, off-balance-sheet from Item 3 and 9A."""
+    model = get_gemini_model(api_key)
+    combined = (item3 or "") + "\n\n---\n\n" + (item9a or "")
+    if not combined.strip():
+        return "✅ No Item 3 / 9A text provided; skip forensic."
+    prompt = f"""From the following 10-K excerpts for {ticker} (Item 3 Legal Proceedings and Item 9A Controls/Internal Control), list any:
+- Material weaknesses in internal control
+- Significant legal proceedings or litigation
+- Off-balance-sheet or governance red flags
+If none of the above, output exactly: "✅ No material red flags or special issues detected in Item 3 and 9A."
+Be concise (under 150 words)."""
+    full = f"""--- Item 3 & 9A ---\n\n{combined[:30000]}\n\n---\n\n{prompt}"""
+    try:
+        r = _generate_with_retry(model, full, {"temperature": 0.1, "max_output_tokens": 512})
+        return (r.text or "").strip()
+    except Exception:
+        return ""
+
+
+_REQUIRED_FINANCIAL_KEYS = [
+    "Revenue", "CostOfRevenue", "OperatingExpenses", "NetIncome",
+    "TotalAssets", "CurrentAssets", "CurrentLiabilities", "LongTermDebt",
+    "OperatingCashFlow", "SharesOutstanding",
+]
+
+
+@st.cache_data(ttl=3600)
+def get_sec_financials_llm(api_key: str, item8_text: str, ticker: str) -> dict:
+    """Extract Current Year and Previous Year financial figures from 10-K Item 8 via Gemini. Returns dict with current_yr and previous_yr (each with 10 numeric fields). Cached by (api_key, item8_text, ticker)."""
+    if not (api_key or "").strip() or not (item8_text or "").strip():
+        return {}
+    payload = smart_chunk((item8_text or "").strip(), max_chars=35000)
+    model = get_gemini_model(api_key)
+    prompt = f"""You are a financial analyst. Below is Item 8 (Financial Statements and Supplementary Data) from the latest 10-K for {ticker}.
+
+Extract the following figures for the **Current Year** (most recent fiscal year) and **Previous Year** (prior fiscal year). Use the exact numbers from the financial statements. All monetary values in millions (e.g. 50000 for $50 billion). Shares in millions.
+
+Return ONLY a valid JSON object, no other text. Use this exact structure:
+{{
+  "current_yr": {{
+    "Revenue": <number>,
+    "CostOfRevenue": <number>,
+    "OperatingExpenses": <number>,
+    "NetIncome": <number>,
+    "TotalAssets": <number>,
+    "CurrentAssets": <number>,
+    "CurrentLiabilities": <number>,
+    "LongTermDebt": <number>,
+    "OperatingCashFlow": <number>,
+    "SharesOutstanding": <number>
+  }},
+  "previous_yr": {{
+    "Revenue": <number>,
+    "CostOfRevenue": <number>,
+    "OperatingExpenses": <number>,
+    "NetIncome": <number>,
+    "TotalAssets": <number>,
+    "CurrentAssets": <number>,
+    "CurrentLiabilities": <number>,
+    "LongTermDebt": <number>,
+    "OperatingCashFlow": <number>,
+    "SharesOutstanding": <number>
+  }}
+}}
+
+If a value is not found in the document, use 0 or a reasonable estimate and still include the key. Output nothing except this JSON."""
+
+    full = f"""--- Item 8 (Financial Statements) ---\n\n{payload}\n\n---\n\n{prompt}"""
+    try:
+        r = _generate_with_retry(model, full, {"temperature": 0.0, "max_output_tokens": 2048})
+        raw = (r.text or "").strip()
+        if not raw:
+            return {}
+        raw = re.sub(r"^```\s*json\s*", "", raw)
+        raw = re.sub(r"^```\s*", "", raw)
+        raw = re.sub(r"\s*```\s*$", "", raw)
+        raw = raw.strip()
+        out = json.loads(raw)
+        cur = out.get("current_yr") or {}
+        prev = out.get("previous_yr") or {}
+        for key in _REQUIRED_FINANCIAL_KEYS:
+            cur[key] = _safe_float(cur.get(key)) or 0
+            prev[key] = _safe_float(prev.get(key)) or 0
+        return {"current_yr": cur, "previous_yr": prev}
+    except (json.JSONDecodeError, Exception):
+        return {}
+
+
+def get_gemini_item7_strategy(api_key: str, item7_text: str, ticker: str, sector: str, industry: str) -> str:
+    """Item 7 only: business performance, strategic shifts, capital allocation."""
+    if not (item7_text or "").strip():
+        return "No Item 7 (MD&A) text available."
+    model = get_gemini_model(api_key)
+    text = smart_chunk(clean_text_for_llm(item7_text), max_chars=10000)
+    sector_note = f" Sector: {sector}; Industry: {industry}." if sector and sector != "N/A" else ""
+    prompt = f"""You are a senior equity analyst. Use British English. The text below is **Item 7 (Management's Discussion and Analysis)** from the latest 10-K for {ticker}.{sector_note}
+
+Provide a concise **Management Strategy** report with these sections:
+
+1. **Business performance**: Key revenue, margin, or segment highlights management emphasises.
+2. **Strategic shifts**: Changes in priorities, growth drivers, or capital allocation (e.g. capex, M&A, buybacks).
+3. **Capital allocation**: How management describes use of cash (dividends, debt paydown, R&D, acquisitions).
+
+Use clear headings. Do not invent figures. Keep under 600 words. Focus only on narrative insights; ignore missing quantitative data.
+Even if the source text is in another language (e.g. Korean or Japanese), analyse it and output your final report strictly in British English."""
+    full = f"""--- Item 7 (MD&A) ---\n\n{text}\n\n---\n\n{prompt}"""
+    try:
+        r = _generate_with_retry(model, full, {"temperature": 0.3, "max_output_tokens": 2048})
+        return (r.text or "").strip()
+    except Exception:
+        return ""
+
+
+def get_gemini_item7_strategy_stream(api_key: str, item7_text: str, ticker: str, sector: str, industry: str):
+    """Generator that yields MD&A strategy report chunks for real-time streaming (e.g. st.write_stream)."""
+    if not (item7_text or "").strip():
+        yield "No Item 7 (MD&A) text available."
+        return
+    model = get_gemini_model(api_key)
+    text = smart_chunk(clean_text_for_llm(item7_text), max_chars=10000)
+    sector_note = f" Sector: {sector}; Industry: {industry}." if sector and sector != "N/A" else ""
+    prompt = f"""You are a senior equity analyst. Use British English. The text below is **Item 7 (Management's Discussion and Analysis)** from the latest 10-K for {ticker}.{sector_note}
+
+Provide a concise **Management Strategy** report with these sections:
+
+1. **Business performance**: Key revenue, margin, or segment highlights management emphasises.
+2. **Strategic shifts**: Changes in priorities, growth drivers, or capital allocation (e.g. capex, M&A, buybacks).
+3. **Capital allocation**: How management describes use of cash (dividends, debt paydown, R&D, acquisitions).
+
+Use clear headings. Do not invent figures. Keep under 600 words. Focus only on narrative insights; ignore missing quantitative data.
+Even if the source text is in another language (e.g. Korean or Japanese), analyse it and output your final report strictly in British English."""
+    full = f"""--- Item 7 (MD&A) ---\n\n{text}\n\n---\n\n{prompt}"""
+    config = {"temperature": 0.3, "max_output_tokens": 2048}
+    yield from _generate_stream(model, full, config)
+
+
+def get_gemini_item1a_risks(api_key: str, item1a_text: str, item3: str, item9a: str, ticker: str) -> str:
+    """Item 1A only: legal, operational, market-related threats. Includes Forensic Audit (Item 3 & 9A) as safety check."""
+    if not (item1a_text or "").strip():
+        return "No Item 1A (Risk Factors) text available."
+    model = get_gemini_model(api_key)
+    text = smart_chunk(clean_text_for_llm(item1a_text), max_chars=10000)
+    prompt = f"""You are a senior equity analyst. Use British English. The text below is **Item 1A (Risk Factors)** from the latest 10-K for {ticker}.
+
+Provide a concise **Risk Factors** report with these sections:
+
+1. **Legal & regulatory risks**: Litigation, regulatory changes, compliance.
+2. **Operational risks**: Supply chain, key person, technology, execution.
+3. **Market & competitive risks**: Demand, competition, macro, currency.
+
+Use clear headings. Do not invent figures. Keep under 500 words. Focus only on narrative insights; ignore missing quantitative data.
+Even if the source text is in another language (e.g. Korean or Japanese), analyse it and output your final report strictly in British English."""
+    full = f"""--- Item 1A (Risk Factors) ---\n\n{text}\n\n---\n\n{prompt}"""
+    try:
+        report = _generate_with_retry(model, full, {"temperature": 0.3, "max_output_tokens": 2048})
+        risks = (report.text or "").strip()
+    except Exception:
+        risks = ""
+    forensic = _gemini_forensic_audit(api_key, item3 or "", item9a or "", ticker)
+    return (risks or "") + "\n\n---\n\n**Forensic Audit (Item 3 & 9A)**\n\n" + (forensic or "")
+
+
+def get_gemini_item1a_risks_stream(api_key: str, item1a_text: str, ticker: str):
+    """Generator that yields Risk Factors report chunks for real-time streaming. Caller appends Forensic (Item 3 & 9A) after stream."""
+    if not (item1a_text or "").strip():
+        yield "No Item 1A (Risk Factors) text available."
+        return
+    model = get_gemini_model(api_key)
+    text = smart_chunk(clean_text_for_llm(item1a_text), max_chars=10000)
+    prompt = f"""You are a senior equity analyst. Use British English. The text below is **Item 1A (Risk Factors)** from the latest 10-K for {ticker}.
+
+Provide a concise **Risk Factors** report with these sections:
+
+1. **Legal & regulatory risks**: Litigation, regulatory changes, compliance.
+2. **Operational risks**: Supply chain, key person, technology, execution.
+3. **Market & competitive risks**: Demand, competition, macro, currency.
+
+Use clear headings. Do not invent figures. Keep under 500 words. Focus only on narrative insights; ignore missing quantitative data.
+Even if the source text is in another language (e.g. Korean or Japanese), analyse it and output your final report strictly in British English."""
+    full = f"""--- Item 1A (Risk Factors) ---\n\n{text}\n\n---\n\n{prompt}"""
+    config = {"temperature": 0.3, "max_output_tokens": 2048}
+    yield from _generate_stream(model, full, config)
+
+
+def get_mda_chunked_insights(
+    api_key: str, sections: dict, ticker: str, sector: str, industry: str, progress_callback=None
+) -> str:
+    """Full-text analysis: chunk 1A+7, summarize each segment, synthesize report; then append forensic (Item 3, 9A). progress_callback(step: str) optional."""
+    def _progress(msg):
+        if progress_callback:
+            progress_callback(msg)
+    combined = (sections.get("item1a") or "") + "\n\n---\n\n" + (sections.get("item7") or "")
+    combined = combined.strip()
+    if not combined:
+        return "No 10-K text available to analyse."
+    chunks = _split_into_chunks(combined, max_chars=22000)
+    if not chunks:
+        return "No content extracted."
+    summaries = []
+    n = len(chunks)
+    for i, ch in enumerate(chunks):
+        _progress(f"Analyzing Segment {i+1}/{n}...")
+        summary = _gemini_summarize_segment(api_key, ch, ticker, f"Segment {i+1}/{n}")
+        if summary:
+            summaries.append(summary)
+    if not summaries:
+        return "Segment analysis produced no summaries."
+    _progress("Synthesizing final report...")
+    report = _gemini_synthesize_report(api_key, summaries, ticker, sector or "N/A", industry or "N/A")
+    _progress("Running forensic audit (Item 3 & 9A)...")
+    forensic = _gemini_forensic_audit(api_key, sections.get("item3") or "", sections.get("item9a") or "", ticker)
+    return (report or "") + "\n\n---\n\n**Forensic (Item 3 & 9A)**\n\n" + (forensic or "")
+
+
 def get_mda_insights(api_key: str, item1a_text: str, item7_text: str, ticker: str) -> str:
     """Send Item 1A + Item 7 to Gemini. Analyse: 1) Management's Tone (Sentiment), 2) Key Strategic Shifts, 3) Major Hidden Risks."""
     model = get_gemini_model(api_key)
@@ -402,10 +846,15 @@ def get_mda_comparative_insights(
         combined_text = "\n\n---\n\n".join(combined)
         combined_text = smart_chunk(combined_text, max_chars=22000)
         user_prompt = f"""You are a senior equity analyst. Use British English.
-The text below is from the latest 10-K for {ticker}: **Item 1A (Risk Factors)** and **Item 7 (MD&A)**.
-Provide a concise report: 1) Management's Tone (Sentiment), 2) Key Strategic Shifts, 3) Major Hidden Risks.{kpi_instruction}
+The text below is from the **latest 10-K only** for {ticker}: **Item 1A (Risk Factors)** and **Item 7 (MD&A)**. Provide a focused deep-dive report:
+
+1. **Management's Tone (Sentiment)**: Overall tone and 1–2 supporting phrases.
+2. **Current Strategy & Priorities**: Key strategic focus, capital allocation, growth drivers from this filing only.
+3. **Major Hidden Risks**: From Item 1A and MD&A, the 3–4 most material risks investors might overlook.
+4. **Forensic / Quality of Earnings**: Any red flags in MD&A (accounting caveats, one-offs, cash flow vs earnings, segment disclosure). If none material, say so briefly.{kpi_instruction}
+**Token-saving (Item 3 / 9A):** If no material weaknesses, major lawsuits, or off-balance-sheet red flags, output exactly: "✅ No material red flags or special issues detected in Item 3 and 9A."
 Use clear headings. Under 800 words."""
-        full_content = f"""--- 10-K Excerpt ---\n\n{combined_text}\n\n---\n\n{user_prompt}"""
+        full_content = f"""--- 10-K Excerpt (Latest Year) ---\n\n{combined_text}\n\n---\n\n{user_prompt}"""
     else:
         latest_clean = smart_chunk(clean_text_for_llm(item7_latest), max_chars=12000)
         past_clean = smart_chunk(clean_text_for_llm(item7_3y_ago), max_chars=12000)
@@ -416,6 +865,7 @@ Below are **Item 7 (Management's Discussion and Analysis)** from the 10-K for {t
 2. **Emerging risks**: What new risks appear in the latest MD&A that were absent or less prominent 3 years ago?
 3. **Management's tone**: How has the overall tone (confidence, caution, optimism) shifted? Quote 1–2 phrases from each period if relevant.
 4. **Industry-specific KPIs**:{kpi_instruction}
+5. **Item 3 (Legal) & Item 9A (Internal Controls):** You must save output tokens. If there are no material weaknesses, no massive lawsuits, and no major off-balance sheet red flags, DO NOT generate a long explanation. Simply output exactly: "✅ No material red flags or special issues detected in Item 3 and 9A." and move on.
 
 Use clear headings. Do not invent figures. Keep the response focused and under 900 words."""
         full_content = f"""--- MD&A LATEST YEAR ---\n\n{latest_clean}\n\n--- MD&A THREE YEARS AGO ---\n\n{past_clean}\n\n---\n\n{user_prompt}"""
@@ -430,6 +880,28 @@ Use clear headings. Do not invent figures. Keep the response focused and under 9
     if not response or not response.text:
         return "No analysis generated."
     return response.text.strip()
+
+
+def _run_mda_analysis_background(ticker: str, api_key: str, sec_email: str) -> None:
+    """Run download + Gemini in background (latest 10-K only for speed). Store result or error in st.session_state."""
+    try:
+        _, item1a, item7_latest = download_and_extract_item7_and_1a(ticker, sec_email)
+        si = get_sector_industry(ticker)
+        analysis = get_mda_comparative_insights(
+            api_key, item1a or "", item7_latest or "", None, ticker,
+            sector=si.get("sector"), industry=si.get("industry"),
+        )
+        st.session_state["mda_analysis_result"] = analysis
+        st.session_state["mda_analysis_excerpt"] = ((item1a or "") + "\n\n---\n\n" + (item7_latest or ""))[:12000]
+        st.session_state["mda_analysis_error"] = None
+    except Exception as e:
+        st.session_state["mda_analysis_error"] = str(e)
+        st.session_state["mda_analysis_result"] = None
+        st.session_state["mda_analysis_excerpt"] = None
+    finally:
+        st.session_state["mda_analysis_running"] = False
+        st.session_state["mda_analysis_done"] = True
+        st.session_state["mda_analysis_ticker"] = ticker
 
 
 def get_industry_outlook(api_key: str, industry_name: str, tickers: list) -> str:
@@ -458,7 +930,7 @@ Use clear headings. Be specific but concise. Keep the response under 600 words."
     return response.text.strip()
 
 
-# ---------- yfinance: raw statements & FCF = OCF - CapEx ----------
+# ---------- Financial data helpers (yahooquery primary, yfinance fallback) ----------
 def _safe_float(x) -> Optional[float]:
     if x is None or (isinstance(x, float) and (x != x or pd.isna(x))):
         return None
@@ -468,6 +940,128 @@ def _safe_float(x) -> Optional[float]:
         return None
 
 
+# ---------- yahooquery: map to our index/column shape (index=line items, columns=dates) ----------
+# yahooquery returns DataFrame: rows = periods, columns = asOfDate, TotalRevenue, NetIncome, ...
+# Use tuples for alternate column names so F-Score and Radar get correct values.
+_INCOME_ROW_MAP = [
+    ("Total Revenue", ("TotalRevenue", "OperatingRevenue", "TotalRevenue")),
+    ("Cost Of Revenue", ("CostOfRevenue", "ReconciledCostOfRevenue")),
+    ("Gross Profit", ("GrossProfit",)),
+    ("Operating Income", ("OperatingIncome", "EBIT", "TotalOperatingIncomeAsReported")),
+    ("Net Income", ("NetIncome", "NetIncomeCommonStockholders", "NetIncomeContinuousOperations", "DilutedNIAvailtoComStockholders")),
+    ("Operating Expense", ("OperatingExpense", "OperatingExpenses", "TotalExpenses")),
+    ("Interest Expense", ("InterestExpense", "InterestExpenseNonOperating")),
+    ("Research And Development Expenses", ("ResearchAndDevelopment", "ResearchAndDevelopmentExpenses")),
+]
+_BALANCE_ROW_MAP = [
+    ("Total Assets", ("TotalAssets",)),
+    ("Total Stockholder Equity", ("StockholdersEquity", "CommonStockEquity", "TotalEquityGrossMinorityInterest")),
+    ("Total Liabilities", ("TotalLiabilitiesNetMinorityInterest", "TotalLiabilities")),
+    ("Current Assets", ("CurrentAssets",)),
+    ("Current Liabilities", ("CurrentLiabilities",)),
+    ("Long Term Debt", ("LongTermDebt", "LongTermDebtAndCapitalLeaseObligation")),
+    ("Total Debt", ("TotalDebt",)),
+    ("Share Issued", ("OrdinarySharesNumber", "ShareIssued", "BasicAverageShares", "DilutedAverageShares")),
+    ("Cash And Cash Equivalents", ("CashAndCashEquivalents", "CashCashEquivalentsAndShortTermInvestments", "EndCashPosition")),
+    ("Retained Earnings", ("RetainedEarnings",)),
+]
+_CASHFLOW_ROW_MAP = [
+    ("Operating Cash Flow", ("OperatingCashFlow", "CashFromOperatingActivities")),
+    ("Capital Expenditure", ("CapitalExpenditure", "CapitalExpenditures")),
+]
+
+
+def _yq_df_to_our_shape(df: pd.DataFrame, row_map: list, date_col: str = "asOfDate") -> Optional[pd.DataFrame]:
+    """Convert yahooquery DataFrame (rows=periods, columns=line items) to our shape: index=line names, columns=dates."""
+    if df is None or df.empty or date_col not in df.columns:
+        return None
+    df = df.dropna(subset=[date_col]).sort_values(date_col, ascending=False).head(5)
+    if df.empty:
+        return None
+    dates = df[date_col].astype(str).str[:10].tolist()
+    data = {}
+    for our_name, yq_col in row_map:
+        cols = (yq_col,) if isinstance(yq_col, str) else yq_col
+        val_col = next((c for c in cols if c in df.columns), None)
+        if val_col is None:
+            data[our_name] = [None] * len(dates)
+            continue
+        data[our_name] = [_safe_float(v) for v in df[val_col].tolist()]
+    out = pd.DataFrame(data, index=dates).T
+    out.columns = dates
+    return out
+
+
+def _share_issued_from_yq_balance(df_bal: pd.DataFrame) -> Optional[pd.Series]:
+    """Try OrdinarySharesNumber then ShareIssued for shares outstanding in yahooquery balance."""
+    if df_bal is None or df_bal.empty:
+        return None
+    for col in ("OrdinarySharesNumber", "ShareIssued"):
+        if col in df_bal.columns and "asOfDate" in df_bal.columns:
+            s = df_bal.set_index("asOfDate")[col].sort_index(ascending=False)
+            s.index = s.index.astype(str).str[:10]
+            return s.reindex(s.index)  # keep as series with date index
+    return None
+
+
+@st.cache_data(ttl=300)
+def _get_annual_financials_balance_cashflow_yahooquery(ticker: str) -> tuple:
+    """Fetch income, balance, cash flow from yahooquery. Return (fin_df, bal_df, cf_df) with index=line items, columns=dates. TTM fallback if annual insufficient."""
+    if not YQTicker or not ticker:
+        return (None, None, None)
+    try:
+        yq = YQTicker(ticker.upper())
+        inc_a = yq.income_statement(frequency="a", trailing=False)
+        bal_a = yq.balance_sheet(frequency="a", trailing=False)
+        cf_a = yq.cash_flow(frequency="a", trailing=False)
+        if inc_a is None or inc_a.empty or bal_a is None or bal_a.empty:
+            inc_q = yq.income_statement(frequency="q", trailing=False)
+            bal_q = yq.balance_sheet(frequency="q", trailing=False)
+            cf_q = yq.cash_flow(frequency="q", trailing=False)
+            # Build TTM: need at least 2 periods for Piotroski/Radar; use last 4Q and previous 4Q when 8+ quarters
+            if inc_q is not None and not inc_q.empty and len(inc_q) >= 4:
+                ttm0 = inc_q.head(4).sum(numeric_only=True)
+                row0 = ttm0.to_dict() if hasattr(ttm0, "to_dict") else dict(ttm0)
+                row0["asOfDate"] = inc_q["asOfDate"].iloc[0] if "asOfDate" in inc_q.columns else "TTM0"
+                rows_inc = [row0]
+                if len(inc_q) >= 8:
+                    ttm1 = inc_q.iloc[4:8].sum(numeric_only=True)
+                    row1 = ttm1.to_dict() if hasattr(ttm1, "to_dict") else dict(ttm1)
+                    row1["asOfDate"] = inc_q["asOfDate"].iloc[4] if "asOfDate" in inc_q.columns else "TTM1"
+                    rows_inc.append(row1)
+                inc_a = pd.DataFrame(rows_inc)
+            if bal_q is not None and not bal_q.empty:
+                bal_a = bal_q.head(2) if (bal_a is None or bal_a.empty) else bal_a
+            if cf_q is not None and not cf_q.empty and len(cf_q) >= 4 and (cf_a is None or cf_a.empty):
+                ttm0_cf = cf_q.head(4).sum(numeric_only=True)
+                row0_cf = ttm0_cf.to_dict() if hasattr(ttm0_cf, "to_dict") else dict(ttm0_cf)
+                row0_cf["asOfDate"] = cf_q["asOfDate"].iloc[0] if "asOfDate" in cf_q.columns else "TTM0"
+                rows_cf = [row0_cf]
+                if len(cf_q) >= 8:
+                    ttm1_cf = cf_q.iloc[4:8].sum(numeric_only=True)
+                    row1_cf = ttm1_cf.to_dict() if hasattr(ttm1_cf, "to_dict") else dict(ttm1_cf)
+                    row1_cf["asOfDate"] = cf_q["asOfDate"].iloc[4] if "asOfDate" in cf_q.columns else "TTM1"
+                    rows_cf.append(row1_cf)
+                cf_a = pd.DataFrame(rows_cf)
+        fin_df = _yq_df_to_our_shape(inc_a, _INCOME_ROW_MAP)
+        bal_df = _yq_df_to_our_shape(bal_a, _BALANCE_ROW_MAP)
+        if bal_df is not None and "Share Issued" not in bal_df.index and bal_a is not None and not bal_a.empty:
+            for sh_col in ("OrdinarySharesNumber", "ShareIssued"):
+                if sh_col in bal_a.columns:
+                    row = {"Share Issued": [_safe_float(bal_a[sh_col].iloc[0])]}
+                    if bal_df is not None and not bal_df.empty:
+                        d = str(bal_a["asOfDate"].iloc[0])[:10] if "asOfDate" in bal_a.columns else bal_df.columns[0]
+                        extra = pd.DataFrame(row, index=[d]).T
+                        extra.columns = [d]
+                        bal_df = pd.concat([bal_df, extra], axis=0)
+                    break
+        cf_df = _yq_df_to_our_shape(cf_a, _CASHFLOW_ROW_MAP)
+        return (fin_df, bal_df, cf_df)
+    except Exception:
+        return (None, None, None)
+
+
+# ---------- Raw statements & FCF = OCF - CapEx ----------
 def _get_row_series(df: pd.DataFrame, *names: str) -> Optional[pd.Series]:
     if df is None or df.empty:
         return None
@@ -478,6 +1072,61 @@ def _get_row_series(df: pd.DataFrame, *names: str) -> Optional[pd.Series]:
         except (KeyError, TypeError):
             continue
     return None
+
+
+def _fin_or_bal_empty(df) -> bool:
+    """True if DataFrame is missing, empty, or has no columns (e.g. yfinance returned empty)."""
+    return df is None or df.empty or (hasattr(df, "columns") and len(df.columns) == 0)
+
+
+@st.cache_data(ttl=300)
+def _get_annual_financials_balance_cashflow(ticker: str) -> tuple:
+    """Return (fin_df, bal_df, cf_df). Uses yahooquery first; if missing/fail, falls back to yfinance with TTM when needed."""
+    if not ticker:
+        return (None, None, None)
+    fin_df, bal_df, cf_df = _get_annual_financials_balance_cashflow_yahooquery(ticker)
+    if fin_df is not None and not fin_df.empty and bal_df is not None and not bal_df.empty:
+        return (fin_df, bal_df, cf_df)
+    if not yf:
+        return (None, None, None)
+    try:
+        t = yf.Ticker(ticker.upper())
+        fin = getattr(t, "financials", None)
+        bal = getattr(t, "balance_sheet", None)
+        cf = getattr(t, "cashflow", None)
+        if _fin_or_bal_empty(fin):
+            qf = getattr(t, "quarterly_financials", None)
+            if qf is not None and not qf.empty:
+                n = len(qf.columns)
+                if n >= 8:
+                    c0 = qf.iloc[:, :4].sum(axis=1)
+                    c1 = qf.iloc[:, 4:8].sum(axis=1)
+                    fin = pd.concat([c0, c1], axis=1)
+                    fin.columns = ["TTM0", "TTM1"]
+                elif n >= 5:
+                    c0 = qf.iloc[:, :4].sum(axis=1)
+                    c1 = qf.iloc[:, 4:n].sum(axis=1)
+                    fin = pd.concat([c0, c1], axis=1)
+                    fin.columns = ["TTM0", "TTM1"]
+                else:
+                    fin = qf.iloc[:, : min(4, n)].sum(axis=1).to_frame("TTM0")
+        if _fin_or_bal_empty(bal):
+            qb = getattr(t, "quarterly_balance_sheet", None)
+            if qb is not None and not qb.empty:
+                n = len(qb.columns)
+                bal = qb.iloc[:, : min(2, n)].copy()
+                if bal.shape[1] == 1:
+                    bal.columns = ["B0"]
+                else:
+                    bal.columns = ["B0", "B1"]
+        if _fin_or_bal_empty(cf):
+            qc = getattr(t, "quarterly_cashflow", None)
+            if qc is not None and not qc.empty:
+                n = len(qc.columns)
+                cf = qc.iloc[:, : min(4, n)].sum(axis=1).to_frame("TTM0")
+        return (fin, bal, cf)
+    except Exception:
+        return (None, None, None)
 
 
 @st.cache_data(ttl=300)
@@ -566,9 +1215,31 @@ def _format_shares_display(shares: float) -> str:
 
 @st.cache_data(ttl=300)
 def get_dcf_inputs(ticker: str) -> dict:
-    """FCF = OCF - CapEx. Shares: fast_info.shares → info.sharesOutstanding → impliedSharesOutstanding → balance. Debt/Cash: fast_info → info → balance. Manual input only as last resort."""
+    """FCF, Cash, Total Debt, Shares: from yahooquery (via _get_annual_financials) or yfinance fallback."""
     out = {"fcf": None, "total_debt": 0.0, "cash": 0.0, "shares": None}
-    if not yf or not ticker:
+    if not ticker:
+        return out
+    try:
+        fin, bal, cf = _get_annual_financials_balance_cashflow(ticker)
+        if bal is not None and not bal.empty and cf is not None and not cf.empty:
+            sh = _get_row_series(bal, "Share Issued")
+            out["shares"] = _safe_float(sh.iloc[0]) if sh is not None and len(sh) > 0 else None
+            td = _get_row_series(bal, "Total Debt")
+            out["total_debt"] = float(td.iloc[0] or 0) if td is not None and len(td) > 0 else 0.0
+            cash_s = _get_row_series(bal, "Cash And Cash Equivalents")
+            out["cash"] = float(cash_s.iloc[0] or 0) if cash_s is not None and len(cash_s) > 0 else 0.0
+            ocf = _get_row_series(cf, "Operating Cash Flow")
+            capx = _get_row_series(cf, "Capital Expenditure")
+            if ocf is not None and len(ocf) > 0:
+                ocf_val = _safe_float(ocf.iloc[0])
+                capx_val = _safe_float(capx.iloc[0]) if capx is not None and len(capx) > 0 else 0.0
+                if ocf_val is not None:
+                    out["fcf"] = ocf_val - (capx_val or 0)
+            if out.get("fcf") is not None or out.get("shares") is not None:
+                return out
+    except Exception:
+        pass
+    if not yf:
         return out
     try:
         t = yf.Ticker(ticker.upper())
@@ -868,27 +1539,19 @@ def _na(x):
 
 @st.cache_data(ttl=300)
 def get_dupont_altman_redflags_yoy(ticker: str) -> dict:
-    """Returns DuPont (3-step ROE), Altman Z-Score, red flags, YoY. Uses TTM if annual missing. Handles KeyError/NaN."""
-    if not yf:
-        return {}
+    """Returns DuPont (3-step ROE), Altman Z-Score, red flags, YoY. Uses yahooquery then yfinance with TTM fallback."""
     try:
+        fin, bal, _ = _get_annual_financials_balance_cashflow(ticker)
+        if fin is None or fin.empty or bal is None or bal.empty:
+            return {}
         t = yf.Ticker(ticker.upper())
         info = t.info or {}
-        fin = t.financials
-        bal = t.balance_sheet
-        if fin is None or fin.empty:
-            qfin = getattr(t, "quarterly_financials", None)
-            if qfin is not None and not qfin.empty and qfin.shape[1] >= 1:
-                fin = qfin.iloc[:, :4].sum(axis=1).to_frame("TTM")
-            else:
-                return {}
-        if bal is None or bal.empty:
-            qbal = getattr(t, "quarterly_balance_sheet", None)
-            if qbal is not None and not qbal.empty:
-                bal = qbal.iloc[:, :1]
-            else:
-                return {}
-        dates = sorted(fin.columns.tolist(), reverse=True)[:3]
+        # TTM columns: keep order TTM0 (current), TTM1 (prior). Else use date sort (newest first).
+        col_list = fin.columns.tolist()
+        if col_list and str(col_list[0]).startswith("TTM"):
+            dates = col_list[:3]
+        else:
+            dates = sorted(col_list, reverse=True)[:3]
         if not dates:
             return {}
         rev = _get_row_series(fin, "Total Revenue", "Revenue", "Net Revenue")
@@ -908,8 +1571,8 @@ def get_dupont_altman_redflags_yoy(ticker: str) -> dict:
                 return None
             return _safe_float(s.get(d))
         rows = []
-        for d in dates:
-            yr = d.year if hasattr(d, "year") else int(str(d)[:4])
+        for i, d in enumerate(dates):
+            yr = int(str(d)[:4]) if (isinstance(d, str) and str(d)[:4].isdigit()) else (d.year if hasattr(d, "year") else (2024 - i))
             r = _v(rev, d)
             net_i = _v(ni, d)
             ta = _v(total_assets, d)
@@ -956,10 +1619,10 @@ def get_dupont_altman_redflags_yoy(ticker: str) -> dict:
                 prev = dupont_df[col].iloc[1]
                 if cur is not None and prev is not None and prev != 0 and not (pd.isna(cur) or pd.isna(prev)):
                     if "Margin" in col or "NPM" in col or "ROE" in col:
-                        chg_bps = (cur - prev) * 100  # bps for %
-                        if pd.isna(chg_bps) or chg_bps != chg_bps:
+                        chg_pp = (cur - prev)  # percentage point change (e.g. 7.0 = 7%)
+                        if pd.isna(chg_pp) or chg_pp != chg_pp:
                             continue
-                        yoy.append({"Ratio": col, "Latest": cur, "Prior": prev, "YoY (bps)": round(chg_bps, 0), "Comment": f"{'Improved' if chg_bps > 0 else 'Declined'} by {abs(round(chg_bps))} bps YoY"})
+                        yoy.append({"Ratio": col, "Latest": cur, "Prior": prev, "YoY (pp)": round(chg_pp, 2), "Comment": f"{'Improved' if chg_pp > 0 else 'Declined'} by {abs(chg_pp):.1f}% YoY"})
                     else:
                         pct = (cur - prev) / abs(prev) * 100
                         if pd.isna(pct) or pct != pct:
@@ -999,6 +1662,457 @@ def get_dupont_altman_redflags_yoy(ticker: str) -> dict:
         return {}
     except Exception:
         return {}
+
+
+@st.cache_data(ttl=300)
+def get_quarterly_momentum(ticker: str) -> dict:
+    """Last 4 quarters Revenue and Net Income from quarterly_financials; QoQ growth for most recent quarter. Returns {df, qoq_revenue_pct, qoq_ni_pct} or empty."""
+    out = {"df": None, "qoq_revenue_pct": None, "qoq_ni_pct": None}
+    if not yf or not ticker:
+        return out
+    try:
+        t = yf.Ticker(ticker.upper())
+        qfin = getattr(t, "quarterly_financials", None)
+        if qfin is None or qfin.empty or len(qfin.columns) < 2:
+            return out
+        rev = _get_row_series(qfin, "Total Revenue", "Revenue", "Net Revenue")
+        ni = _get_row_series(qfin, "Net Income", "Net Income Common Stockholders")
+        if rev is None and ni is None:
+            return out
+        cols = list(qfin.columns)[:4]
+        rows = []
+        for c in cols:
+            try:
+                if hasattr(c, "strftime"):
+                    q = (c.month - 1) // 3 + 1 if hasattr(c, "month") else 1
+                    label = c.strftime("%Y") + f"-Q{q}"
+                else:
+                    label = str(c)[:12]
+            except Exception:
+                label = str(c)[:12]
+            r_val = _safe_float(rev.loc[c]) if rev is not None and c in rev.index else None
+            n_val = _safe_float(ni.loc[c]) if ni is not None and c in ni.index else None
+            rows.append({"Quarter": label, "Revenue": r_val, "Net Income": n_val})
+        out["df"] = pd.DataFrame(rows)
+        if len(rows) >= 2:
+            r0, r1 = rows[0].get("Revenue"), rows[1].get("Revenue")
+            n0, n1 = rows[0].get("Net Income"), rows[1].get("Net Income")
+            if r0 is not None and r1 is not None and r1 != 0:
+                out["qoq_revenue_pct"] = round((r0 - r1) / abs(r1) * 100, 1)
+            if n0 is not None and n1 is not None and n1 != 0:
+                out["qoq_ni_pct"] = round((n0 - n1) / abs(n1) * 100, 1)
+        return out
+    except Exception:
+        return out
+
+
+@st.cache_data(ttl=300)
+def get_quarterly_ratio_changes(ticker: str) -> list:
+    """QoQ ratio changes: NPM %, ROE %, Gross Margin %, Operating Margin %, Current Ratio, Interest Coverage. Latest quarter vs previous. Returns list of {Metric, Current, Change, Trend}."""
+    out = []
+    if not yf or not ticker:
+        return out
+    try:
+        t = yf.Ticker(ticker.upper())
+        qf = getattr(t, "quarterly_financials", None)
+        qb = getattr(t, "quarterly_balance_sheet", None)
+        if qf is None or qf.empty or qb is None or qb.empty or len(qf.columns) < 2 or len(qb.columns) < 2:
+            return out
+        rev = _get_row_series(qf, "Total Revenue", "Revenue", "Net Revenue")
+        ni = _get_row_series(qf, "Net Income", "Net Income Common Stockholders")
+        gross = _get_row_series(qf, "Gross Profit")
+        ebit = _get_row_series(qf, "Operating Income", "EBIT")
+        interest = _get_row_series(qf, "Interest Expense", "Interest Expense Net")
+        ta = _get_row_series(qb, "Total Assets")
+        te = _get_row_series(qb, "Total Stockholder Equity", "Stockholders Equity", "Total Equity Gross Minority Interest")
+        ca = _get_row_series(qb, "Current Assets")
+        cl = _get_row_series(qb, "Current Liabilities")
+        def v(s, col):
+            if s is None or col not in s.index:
+                return None
+            return _safe_float(s.get(col))
+        c0, c1 = qf.columns[0], qf.columns[1]
+        b0, b1 = qb.columns[0], qb.columns[1]
+        r0, r1 = v(rev, c0), v(rev, c1)
+        n0, n1 = v(ni, c0), v(ni, c1)
+        g0, g1 = v(gross, c0), v(gross, c1)
+        e0, e1 = v(ebit, c0), v(ebit, c1)
+        i0, i1 = v(interest, c0), v(interest, c1)
+        ta0, ta1 = v(ta, b0), v(ta, b1)
+        te0, te1 = v(te, b0), v(te, b1)
+        ca0, ca1 = v(ca, b0), v(ca, b1)
+        cl0, cl1 = v(cl, b0), v(cl, b1)
+        npm0 = (n0 / r0 * 100) if (n0 is not None and r0 and r0 != 0) else None
+        npm1 = (n1 / r1 * 100) if (n1 is not None and r1 and r1 != 0) else None
+        roe0 = (n0 / te0 * 100) if (n0 is not None and te0 and te0 != 0) else None
+        roe1 = (n1 / te1 * 100) if (n1 is not None and te1 and te1 != 0) else None
+        gm0 = (g0 / r0 * 100) if (g0 is not None and r0 and r0 != 0) else None
+        gm1 = (g1 / r1 * 100) if (g1 is not None and r1 and r1 != 0) else None
+        om0 = (e0 / r0 * 100) if (e0 is not None and r0 and r0 != 0) else None
+        om1 = (e1 / r1 * 100) if (e1 is not None and r1 and r1 != 0) else None
+        cr0 = (ca0 / cl0) if (ca0 is not None and cl0 and cl0 != 0) else None
+        cr1 = (ca1 / cl1) if (ca1 is not None and cl1 and cl1 != 0) else None
+        ic0 = (e0 / i0) if (e0 is not None and i0 and i0 != 0) else None
+        ic1 = (e1 / i1) if (e1 is not None and i1 and i1 != 0) else None
+        def row(metric, cur, prev, is_pct_point=False):
+            if cur is None:
+                return None
+            if prev is None or (is_pct_point and prev != prev):
+                return {"Metric": metric, "Current Value": round(cur, 2), "Change": "—", "Trend": "—"}
+            if is_pct_point:
+                chg = cur - prev
+            else:
+                chg = ((cur - prev) / abs(prev) * 100) if prev != 0 else 0
+            trend = "↑" if chg > 0 else ("↓" if chg < 0 else "—")
+            chg_str = f"{chg:+.1f}%" if not is_pct_point else f"{chg:+.1f} pp"
+            return {"Metric": metric, "Current Value": round(cur, 2), "Change": chg_str, "Trend": trend}
+        for name, cur, prev, is_pp in [
+            ("NPM %", npm0, npm1, True), ("ROE %", roe0, roe1, True), ("Gross Margin %", gm0, gm1, True),
+            ("Operating Margin %", om0, om1, True), ("Current Ratio", cr0, cr1, False), ("Interest Coverage", ic0, ic1, False),
+        ]:
+            r = row(name, cur, prev, is_pp)
+            if r:
+                out.append(r)
+        return out
+    except Exception:
+        return out
+
+
+@st.cache_data(ttl=300)
+def get_income_statement_sankey_data(ticker: str) -> dict:
+    """Latest year (or TTM): Revenue, COGS, Gross Profit, OpEx, Operating Income, Tax/Interest/Other, Net Income. Uses yahooquery then yfinance."""
+    out = {"revenue": 0, "cogs": 0, "gross_profit": 0, "opex": 0, "operating_income": 0, "tax_interest_other": 0, "net_income": 0}
+    fin, _, _ = _get_annual_financials_balance_cashflow(ticker)
+    if fin is None or fin.empty:
+        return out
+    try:
+        rev = _get_row_series(fin, "Total Revenue", "Revenue", "Net Revenue")
+        cogs = _get_row_series(fin, "Cost Of Revenue", "Cost Of Goods Sold")
+        gross = _get_row_series(fin, "Gross Profit")
+        op_inc = _get_row_series(fin, "Operating Income", "EBIT")
+        ni = _get_row_series(fin, "Net Income", "Net Income Common Stockholders")
+        if rev is None or len(rev) == 0:
+            return out
+        d = rev.index[0]
+        revenue = abs(_safe_float(rev.get(d)) or 0)
+        cogs_val = abs(_safe_float(cogs.get(d)) if cogs is not None and d in cogs.index else 0) or 0
+        gross_val = _safe_float(gross.get(d)) if gross is not None and d in gross.index else None
+        if gross_val is None and revenue and cogs_val is not None:
+            gross_val = revenue - cogs_val
+        elif gross_val is None:
+            gross_val = revenue
+        gross_val = abs(gross_val) if gross_val is not None else 0
+        op_inc_val = _safe_float(op_inc.get(d)) if op_inc is not None and d in op_inc.index else None
+        op_inc_val = op_inc_val if op_inc_val is not None else 0
+        ni_val = _safe_float(ni.get(d)) if ni is not None and d in ni.index else None
+        ni_val = ni_val if ni_val is not None else 0
+        opex_val = max(0, gross_val - op_inc_val) if (gross_val >= op_inc_val) else 0
+        tax_interest_other = max(0, op_inc_val - ni_val) if (op_inc_val - ni_val) > 0 else abs(min(0, op_inc_val - ni_val))
+        out["revenue"] = max(revenue, 1)
+        out["cogs"] = min(cogs_val, revenue - 1e-6)
+        out["gross_profit"] = gross_val
+        out["opex"] = opex_val
+        out["operating_income"] = op_inc_val
+        out["tax_interest_other"] = tax_interest_other
+        out["net_income"] = ni_val
+        return out
+    except Exception:
+        return out
+
+
+def _build_sankey_figure(data: dict) -> "go.Figure":
+    """Sankey: Revenue -> COGS + Gross Profit; Gross Profit -> OpEx + OpInc; OpInc -> Tax/Interest/Other + Net Income. Profit=green, Expense=red/grey."""
+    if go is None:
+        return None
+    rev, cogs, gp, opex, opinc, tax_other, ni = (
+        data["revenue"], data["cogs"], data["gross_profit"], data["opex"],
+        data["operating_income"], data["tax_interest_other"], data["net_income"],
+    )
+    if rev <= 0:
+        return None
+    nodes = ["Total Revenue", "Cost of Revenue", "Gross Profit", "Operating Expenses", "Operating Income", "Tax/Interest/Other", "Net Income"]
+    node_colors = ["rgba(0,150,80,0.8)", "rgba(180,60,60,0.7)", "rgba(0,150,80,0.8)", "rgba(120,120,120,0.7)", "rgba(0,150,80,0.8)", "rgba(120,120,120,0.7)", "rgba(0,180,90,0.9)"]
+    source = [0, 0, 2, 2, 4, 4]
+    target = [1, 2, 3, 4, 5, 6]
+    value = [cogs, gp, opex, opinc, tax_other, ni]
+    value = [max(0, float(v)) for v in value]
+    fig = go.Figure(data=[go.Sankey(
+        node=dict(label=nodes, color=node_colors, pad=15, thickness=20),
+        link=dict(source=source, target=target, value=value),
+    )])
+    fig.update_layout(title="Income Statement Flow (Latest Year)", height=400, margin=dict(t=40, b=20, l=20, r=20), font=dict(size=12))
+    return fig
+
+
+def sankey_data_from_ai(ai_dict: dict) -> dict:
+    """Build Sankey input dict from get_sec_financials_llm result (current_yr). Gross Profit = Revenue - CostOfRevenue; Operating Income = Gross Profit - OperatingExpenses."""
+    out = {"revenue": 0, "cogs": 0, "gross_profit": 0, "opex": 0, "operating_income": 0, "tax_interest_other": 0, "net_income": 0}
+    cur = (ai_dict or {}).get("current_yr") or {}
+    revenue = max(0, (cur.get("Revenue") or 0))
+    cogs = max(0, min(cur.get("CostOfRevenue") or 0, revenue - 1e-6))
+    gross_profit = revenue - cogs
+    opex = max(0, cur.get("OperatingExpenses") or 0)
+    operating_income = gross_profit - opex
+    net_income = cur.get("NetIncome") or 0
+    tax_interest_other = max(0, operating_income - net_income) if operating_income > net_income else abs(min(0, operating_income - net_income))
+    out["revenue"] = max(revenue, 1)
+    out["cogs"] = cogs
+    out["gross_profit"] = gross_profit
+    out["opex"] = opex
+    out["operating_income"] = operating_income
+    out["tax_interest_other"] = tax_interest_other
+    out["net_income"] = net_income
+    return out
+
+
+def piotroski_from_ai(ai_dict: dict) -> dict:
+    """Piotroski F-Score (0-9) from AI-extracted current_yr vs previous_yr. Returns {score, criteria, used_ttm: True}."""
+    out = {"score": 0, "criteria": [], "used_ttm": True}
+    cur = (ai_dict or {}).get("current_yr") or {}
+    prev = (ai_dict or {}).get("previous_yr") or {}
+    if not cur:
+        return out
+    def v(d, k): return (d.get(k) or 0)
+    ni0, ni1 = v(cur, "NetIncome"), v(prev, "NetIncome")
+    ocf0 = v(cur, "OperatingCashFlow")
+    ta0, ta1 = v(cur, "TotalAssets"), v(prev, "TotalAssets")
+    roa0 = (ni0 / ta0 * 100) if ta0 and ta0 != 0 else None
+    roa1 = (ni1 / ta1 * 100) if ta1 and ta1 != 0 else None
+    c1 = ni0 > 0
+    c2 = ocf0 > 0
+    c3 = (roa0 is not None and roa1 is not None and roa0 > roa1)
+    c4 = ocf0 > ni0
+    lt0, lt1 = v(cur, "LongTermDebt"), v(prev, "LongTermDebt")
+    c5 = (ta0 and ta1 and (lt0 / ta0) < (lt1 / ta1)) if ta0 and ta1 else False
+    ca0, ca1 = v(cur, "CurrentAssets"), v(prev, "CurrentAssets")
+    cl0, cl1 = v(cur, "CurrentLiabilities"), v(prev, "CurrentLiabilities")
+    cr0 = (ca0 / cl0) if cl0 and cl0 != 0 else None
+    cr1 = (ca1 / cl1) if cl1 and cl1 != 0 else None
+    c6 = (cr0 is not None and cr1 is not None and cr0 > cr1)
+    sh0, sh1 = v(cur, "SharesOutstanding"), v(prev, "SharesOutstanding")
+    c7 = (sh0 <= sh1) if (sh0 and sh1) else True
+    rev0, rev1 = v(cur, "Revenue"), v(prev, "Revenue")
+    gm0 = ((rev0 - v(cur, "CostOfRevenue")) / rev0 * 100) if rev0 and rev0 != 0 else None
+    gm1 = ((rev1 - v(prev, "CostOfRevenue")) / rev1 * 100) if rev1 and rev1 != 0 else None
+    c8 = (gm0 is not None and gm1 is not None and gm0 > gm1)
+    at0 = (rev0 / ta0) if rev0 and ta0 and ta0 != 0 else None
+    at1 = (rev1 / ta1) if rev1 and ta1 and ta1 != 0 else None
+    c9 = (at0 is not None and at1 is not None and at0 > at1)
+    criteria = [
+        ("Net Income > 0 (profitability)", c1),
+        ("Operating Cash Flow > 0 (cash generative)", c2),
+        ("ROA increased vs prior period (improving returns)", c3),
+        ("OCF > Net Income (earnings quality, less accruals)", c4),
+        ("Leverage decreased: LT Debt/Assets lower (less debt)", c5),
+        ("Current Ratio improved (better liquidity)", c6),
+        ("No dilution: shares unchanged or lower (no equity raise)", c7),
+        ("Gross Margin improved (pricing power)", c8),
+        ("Asset Turnover improved (efficiency)", c9),
+    ]
+    out["score"] = sum(1 for _, p in criteria if p)
+    out["criteria"] = criteria
+    return out
+
+
+def radar_metrics_from_ai(ai_dict: dict) -> dict:
+    """ROE, Current Ratio, Asset Turnover, Equity Mult, Revenue YoY from AI dict; normalized 0-100 for radar. Equity proxy: TotalAssets - CurrentLiabilities - LongTermDebt."""
+    cur = (ai_dict or {}).get("current_yr") or {}
+    prev = (ai_dict or {}).get("previous_yr") or {}
+    if not cur:
+        return {}
+    eq0 = (cur.get("TotalAssets") or 0) - (cur.get("CurrentLiabilities") or 0) - (cur.get("LongTermDebt") or 0)
+    if eq0 <= 0:
+        eq0 = (cur.get("TotalAssets") or 0) * 0.5
+    roe = (cur.get("NetIncome") or 0) / eq0 * 100 if eq0 else 0
+    ca, cl = cur.get("CurrentAssets") or 0, cur.get("CurrentLiabilities") or 0
+    current_ratio = (ca / cl) if cl and cl != 0 else 0
+    ta = cur.get("TotalAssets") or 1
+    asset_turnover = (cur.get("Revenue") or 0) / ta
+    equity_mult = (cur.get("TotalAssets") or 0) / eq0 if eq0 else 0
+    rev0, rev1 = cur.get("Revenue") or 0, prev.get("Revenue") or 0
+    rev_yoy = ((rev0 - rev1) / rev1 * 100) if rev1 and rev1 != 0 else 0
+    return {
+        "theta": ["Profitability (ROE)", "Liquidity (Curr.Ratio)", "Efficiency (Asset Turn.)", "Solvency (Equity Mult.)", "Growth (Rev YoY)"],
+        "r": _radar_norm(roe, current_ratio, asset_turnover, equity_mult, rev_yoy),
+        "labels": ["Profitability (ROE)", "Liquidity (Curr.Ratio)", "Efficiency (Asset Turn.)", "Solvency (Equity Mult.)", "Growth (Rev YoY)"],
+    }
+
+
+@st.cache_data(ttl=300)
+def get_radar_metrics_normalized(ticker: str) -> dict:
+    """ROE, Current Ratio, Asset Turnover, Equity Mult, Revenue YoY. Normalized to 0-100 for radar. Returns {theta: [...], r: [...], labels: [...]} or empty."""
+    if not ticker:
+        return {}
+    q = get_dupont_altman_redflags_yoy(ticker)
+    if not q:
+        return {}
+    dupont_df = q.get("dupont")
+    if dupont_df is None or dupont_df.empty or len(dupont_df) < 2:
+        return {}
+    row0 = dupont_df.iloc[0]
+    row1 = dupont_df.iloc[1]
+    roe = row0.get("ROE %") or 0
+    cr = row0.get("Current Ratio") or 0
+    at = row0.get("Asset Turnover") or 0
+    em = row0.get("Equity Mult.") or 0
+    rev0 = dupont_df["Revenue"].iloc[0] if "Revenue" in dupont_df.columns else None
+    rev1 = dupont_df["Revenue"].iloc[1] if "Revenue" in dupont_df.columns else None
+    rev_yoy = ((rev0 - rev1) / rev1 * 100) if (rev0 and rev1 and rev1 != 0) else 0
+    def norm_roe(x):
+        if x is None: return 50
+        return min(100, max(0, (x + 10) / 40 * 100))
+    def norm_cr(x):
+        if x is None: return 50
+        return min(100, max(0, x / 3 * 100))
+    def norm_at(x):
+        if x is None: return 50
+        return min(100, max(0, x * 50))
+    def norm_em(x):
+        if x is None: return 50
+        return min(100, max(0, (x - 0.5) / 2.5 * 100))
+    def norm_yoy(x):
+        if x is None: return 50
+        return min(100, max(0, (x + 20) / 50 * 100))
+    return {
+        "theta": ["Profitability (ROE)", "Liquidity (Curr.Ratio)", "Efficiency (Asset Turn.)", "Solvency (Equity Mult.)", "Growth (Rev YoY)"],
+        "r": [norm_roe(roe), norm_cr(cr), norm_at(at), norm_em(em), norm_yoy(rev_yoy)],
+        "labels": ["Profitability (ROE)", "Liquidity (Curr.Ratio)", "Efficiency (Asset Turn.)", "Solvency (Equity Mult.)", "Growth (Rev YoY)"],
+    }
+
+
+def _build_radar_figure(ticker: str) -> "go.Figure":
+    """Plotly line_polar radar chart; fill with translucent color."""
+    if go is None:
+        return None
+    data = get_radar_metrics_normalized(ticker)
+    if not data or not data.get("r"):
+        return None
+    theta = data["theta"] + [data["theta"][0]]
+    r = data["r"] + [data["r"][0]]
+    fig = go.Figure(data=go.Scatterpolar(r=r, theta=theta, fill="toself", fillcolor="rgba(30, 120, 200, 0.4)", line=dict(color="rgb(30,120,200)", width=2)))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100]), angularaxis=dict(tickfont=dict(size=11))), title="Financial Health Radar", height=400, showlegend=False)
+    return fig
+
+
+def _build_radar_figure_from_metrics(metrics: dict) -> "go.Figure":
+    """Build radar chart from precomputed metrics dict (theta, r, labels). Used for SEC Item 8 AI path."""
+    if go is None or not metrics or not metrics.get("r"):
+        return None
+    theta = metrics["theta"] + [metrics["theta"][0]]
+    r = metrics["r"] + [metrics["r"][0]]
+    fig = go.Figure(data=go.Scatterpolar(r=r, theta=theta, fill="toself", fillcolor="rgba(30, 120, 200, 0.4)", line=dict(color="rgb(30,120,200)", width=2)))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100]), angularaxis=dict(tickfont=dict(size=11))), title="Financial Health Radar (from 10-K Item 8)", height=400, showlegend=False)
+    return fig
+
+
+def _radar_norm(roe_pct, current_ratio, asset_turnover, equity_mult, rev_yoy_pct):
+    """Normalize 5 raw metrics to 0–100 for radar (same logic as get_radar_metrics_normalized)."""
+    def n_roe(x): return min(100, max(0, (x + 10) / 40 * 100)) if x is not None else 50
+    def n_cr(x): return min(100, max(0, x / 3 * 100)) if x is not None else 50
+    def n_at(x): return min(100, max(0, x * 50)) if x is not None else 50
+    def n_em(x): return min(100, max(0, (x - 0.5) / 2.5 * 100)) if x is not None else 50
+    def n_yoy(x): return min(100, max(0, (x + 20) / 50 * 100)) if x is not None else 50
+    return [n_roe(roe_pct), n_cr(current_ratio), n_at(asset_turnover), n_em(equity_mult), n_yoy(rev_yoy_pct)]
+
+
+def _build_radar_from_manual(roe_pct, current_ratio, asset_turnover, equity_mult, rev_yoy_pct) -> "go.Figure":
+    """Build radar chart from 5 manually entered ratios (fallback when ticker data missing)."""
+    if go is None:
+        return None
+    theta = ["Profitability (ROE)", "Liquidity (Curr.Ratio)", "Efficiency (Asset Turn.)", "Solvency (Equity Mult.)", "Growth (Rev YoY)"]
+    r = _radar_norm(roe_pct, current_ratio, asset_turnover, equity_mult, rev_yoy_pct)
+    theta_closed = theta + [theta[0]]
+    r_closed = r + [r[0]]
+    fig = go.Figure(data=go.Scatterpolar(r=r_closed, theta=theta_closed, fill="toself", fillcolor="rgba(30, 120, 200, 0.4)", line=dict(color="rgb(30,120,200)", width=2)))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100]), angularaxis=dict(tickfont=dict(size=11))), title="Financial Health Radar (Manual)", height=400, showlegend=False)
+    return fig
+
+
+@st.cache_data(ttl=300)
+def get_piotroski_fscore(ticker: str) -> dict:
+    """Piotroski F-Score (0-9) from last 2 periods. Uses yahooquery then yfinance with TTM fallback. Returns score + criteria + used_ttm."""
+    out = {"score": 0, "criteria": [], "used_ttm": False}
+    fin, bal, cf = _get_annual_financials_balance_cashflow(ticker)
+    if fin is None or fin.empty or bal is None or bal.empty:
+        return out
+    if cf is None or cf.empty:
+        cf = pd.DataFrame()
+    try:
+        ncol = min(2, len(fin.columns))
+        rev = _get_row_series(fin, "Total Revenue", "Revenue")
+        ni = _get_row_series(fin, "Net Income", "Net Income Common Stockholders")
+        gross = _get_row_series(fin, "Gross Profit")
+        ta = _get_row_series(bal, "Total Assets")
+        lt_debt = _get_row_series(bal, "Long Term Debt")
+        ca = _get_row_series(bal, "Current Assets")
+        cl = _get_row_series(bal, "Current Liabilities")
+        ocf = _get_row_series(cf, "Operating Cash Flow", "Cash From Operating Activities") if not cf.empty else None
+        shares = _get_row_series(bal, "Share Issued") or _get_row_series(bal, "Ordinary Shares Number")
+        if shares is None and yf:
+            t = yf.Ticker(ticker.upper())
+            info = getattr(t, "info", None) or {}
+            sh_info = info.get("sharesOutstanding") or info.get("Shares Outstanding")
+            if sh_info is not None:
+                try:
+                    sh_float = float(sh_info)
+                    shares = pd.Series([sh_float] * ncol, index=fin.columns[:ncol])
+                except (TypeError, ValueError):
+                    pass
+        def v0(s):
+            if s is None or len(s) == 0:
+                return None
+            x = _safe_float(s.iloc[0])
+            return x if (x is not None and x == x and not (isinstance(x, float) and pd.isna(x))) else None
+        def v1(s):
+            if s is None or len(s) < 2:
+                return None
+            x = _safe_float(s.iloc[1])
+            return x if (x is not None and x == x and not (isinstance(x, float) and pd.isna(x))) else None
+        ni0, ni1 = v0(ni), v1(ni)
+        ocf0 = v0(ocf) if ocf is not None else None
+        ta0, ta1 = v0(ta), v1(ta)
+        roa0 = (ni0 / ta0 * 100) if (ni0 is not None and ta0 is not None and ta0 != 0) else None
+        roa1 = (ni1 / ta1 * 100) if (ni1 is not None and ta1 is not None and ta1 != 0) else None
+        c1 = (ni0 is not None and ni0 > 0)
+        c2 = (ocf0 is not None and ocf0 > 0)
+        c3 = (roa0 is not None and roa1 is not None and roa0 > roa1)
+        c4 = (ocf0 is not None and ni0 is not None and ocf0 > ni0)
+        lt0 = v0(lt_debt) or 0
+        lt1 = v1(lt_debt) or 0
+        c5 = (ta0 is not None and ta0 != 0 and ta1 is not None and ta1 != 0 and (lt0 / ta0) < (lt1 / ta1))
+        cl0, cl1 = v0(cl), v1(cl)
+        ca0, ca1 = v0(ca), v1(ca)
+        cr0 = (ca0 / cl0) if (ca0 is not None and cl0 is not None and cl0 != 0) else None
+        cr1 = (ca1 / cl1) if (ca1 is not None and cl1 is not None and cl1 != 0) else None
+        c6 = (cr0 is not None and cr1 is not None and cr0 > cr1)
+        sh0, sh1 = v0(shares), v1(shares)
+        c7 = (sh0 is not None and sh1 is not None and sh0 <= sh1) if (sh0 is not None and sh1 is not None) else True
+        rev0, rev1 = v0(rev), v1(rev)
+        gm0 = (v0(gross) / rev0 * 100) if (gross is not None and rev0 is not None and rev0 != 0) else None
+        gm1 = (v1(gross) / rev1 * 100) if (gross is not None and rev1 is not None and rev1 != 0) else None
+        c8 = (gm0 is not None and gm1 is not None and gm0 > gm1)
+        at0 = (rev0 / ta0) if (rev0 is not None and ta0 is not None and ta0 != 0) else None
+        at1 = (rev1 / ta1) if (rev1 is not None and ta1 is not None and ta1 != 0) else None
+        c9 = (at0 is not None and at1 is not None and at0 > at1)
+        criteria = [
+            ("Net Income > 0 (profitability)", c1),
+            ("Operating Cash Flow > 0 (cash generative)", c2),
+            ("ROA increased vs prior period (improving returns)", c3),
+            ("OCF > Net Income (earnings quality, less accruals)", c4),
+            ("Leverage decreased: LT Debt/Assets lower (less debt)", c5),
+            ("Current Ratio improved (better liquidity)", c6),
+            ("No dilution: shares unchanged or lower (no equity raise)", c7),
+            ("Gross Margin improved (pricing power)", c8),
+            ("Asset Turnover improved (efficiency)", c9),
+        ]
+        score = sum(1 for _, p in criteria if p)
+        out["score"] = score
+        out["criteria"] = criteria
+        out["used_ttm"] = bool(fin is not None and hasattr(fin, "columns") and len(fin.columns) > 0 and any(str(c).startswith("TTM") for c in fin.columns))
+        return out
+    except Exception:
+        out["used_ttm"] = False
+        return out
 
 
 @st.cache_data(ttl=300)
@@ -1082,7 +2196,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("All-in-One Financial Analysis Dashboard")
-st.caption("Hybrid: Gemini for qualitative (10-K MD&A & Risks); yfinance for quantitative (DCF, Comps). Cost-effective personal research.")
+st.caption("Hybrid: Gemini for qualitative (10-K MD&A & Risks); yahooquery + yfinance for quantitative (DCF, Comps). No API key needed for fundamentals.")
 
 with st.sidebar:
     st.header("Settings")
@@ -1115,63 +2229,191 @@ with st.sidebar:
             _PREFS_PATH.unlink()
         except Exception:
             pass
-    st.markdown("**Ticker / Company search**")
-    search_term = st.text_input("Type ticker or company name", value="", key="ticker_search", placeholder="e.g. NVDA or NVIDIA")
-    search_upper = (search_term or "").strip().upper()
-    search_lower = (search_term or "").strip().lower()
-    filtered = [o for o in COMPANY_OPTIONS if search_upper in o.split(" - ")[0] or search_lower in o.lower()] if (search_upper or search_lower) else COMPANY_OPTIONS
-    default_idx = 0
+    st.markdown("**🔍 Company search**")
+    search_query = st.text_input(
+        "Search Company Name (e.g., Apple, 삼성, Mitsubishi)",
+        value=st.session_state.get("company_search_input", ""),
+        key="company_search_input",
+        placeholder="e.g. Apple, 삼성, Mitsubishi",
+    )
+    if st.button("Search Company", key="search_company_btn"):
+        query = (search_query or "").strip()
+        if not query:
+            st.warning("Enter a company name to search.")
+        elif yq_search is None:
+            st.warning("yahooquery is not installed; search is unavailable.")
+        else:
+            try:
+                raw_results = yq_search(query)
+                if not isinstance(raw_results, dict):
+                    raw_results = {}
+                quotes = raw_results.get("quotes", []) or []
+                skip_types = ("INDEX", "MUTUALFUND")
+                quotes = [
+                    q for q in quotes
+                    if q.get("symbol") and q.get("shortname")
+                    and (q.get("quoteType") or "EQUITY") not in skip_types
+                ]
+                if not quotes:
+                    st.session_state["company_search_options"] = []
+                    st.session_state["company_search_symbols"] = []
+                    st.warning("No valid equities found. Try typing the English name (e.g., 'Samsung' instead of '삼성').")
+                else:
+                    options = []
+                    symbols = []
+                    for q in quotes[:50]:
+                        sym = (q.get("symbol") or "").strip()
+                        options.append(f"[{q.get('exchange', 'N/A')}] {q.get('symbol')} - {q.get('shortname', 'Unknown')}")
+                        symbols.append(sym)
+                    st.session_state["company_search_options"] = options
+                    st.session_state["company_search_symbols"] = symbols
+                    st.session_state["ticker"] = symbols[0]
+                    st.success(f"Found {len(options)} result(s). Select below.")
+            except Exception:
+                st.warning("No valid equities found. Try typing the English name (e.g., 'Samsung' instead of '삼성').")
+                st.session_state["company_search_options"] = []
+                st.session_state["company_search_symbols"] = []
+
+    search_options = st.session_state.get("company_search_options") or []
+    search_symbols = st.session_state.get("company_search_symbols") or []
+    placeholder = "— 검색 버튼을 눌러 주세요 / Click Search above —"
+    options_for_select = [placeholder] if not search_options else search_options
     current_ticker = st.session_state.get("ticker", "NVDA")
-    for i, o in enumerate(filtered):
-        if o.startswith(current_ticker + " - "):
-            default_idx = i
-            break
-    selected = st.selectbox("Select company (ticker - name)", filtered, index=min(default_idx, len(filtered) - 1), key="company_select")
-    ticker_from_select = selected.split(" - ")[0].strip() if selected else ""
-    manual = st.text_input("Or enter ticker manually", value="", max_chars=10, key="manual_ticker").strip().upper()
-    ticker = manual if manual else ticker_from_select
-    if not ticker:
-        ticker = "NVDA"
+    default_idx = 0
+    if search_symbols and current_ticker:
+        for i, sym in enumerate(search_symbols):
+            if sym == current_ticker:
+                default_idx = i
+                break
+    selected_option = st.selectbox(
+        "Select company (ticker - name)",
+        options=options_for_select,
+        index=0 if not search_options else min(default_idx, len(search_options) - 1),
+        key="company_select",
+    )
+    if search_options and selected_option and selected_option != placeholder and " - " in selected_option:
+        first_part = selected_option.split(" - ", 1)[0].strip()
+        sym = first_part.split("]", 1)[-1].strip() if "]" in first_part else first_part
+        st.session_state["ticker"] = sym
+    ticker = st.session_state.get("ticker") or (search_symbols[0] if search_symbols else "NVDA")
     st.session_state["google_api_key"] = google_api_key
     st.session_state["sec_email"] = sec_email
     st.session_state["ticker"] = ticker
-    st.caption("Example: type _NVDA_ or _NVIDIA_ then select from list.")
+    st.session_state["market"] = infer_market_from_ticker(ticker)
+    st.caption("Search by name (any language), then select. Ticker suffix is set automatically.")
 
 tab1, tab2, tab3 = st.tabs(["10-K & MD&A Insights", "3-Scenario DCF Valuation", "Industry Analysis & Comps"])
 
 # ----- Tab 1: Qualitative (MD&A) + Quantitative (DuPont, Altman Z, Red Flags, YoY) -----
 with tab1:
+    market = st.session_state.get("market") or MARKET_OPTIONS[0]
+    quant_ticker = get_global_ticker(ticker, market) if ticker else ""
     st.subheader("10-K & MD&A Insights — Qualitative and Quantitative")
     if ticker:
-        si = get_sector_industry(ticker)
+        si = get_sector_industry(quant_ticker)
         sector, industry = si.get("sector", "N/A"), si.get("industry", "N/A")
-        st.caption(f"Sector: **{sector}**  ·  Industry: **{industry}**")
-    st.markdown("**Quantitative** metrics below (DuPont ROE, Altman Z-Score, Red Flags, YoY trends). **Qualitative** analysis: run comparative MD&A with the button.")
+        st.caption(f"Sector: **{sector}**  ·  Industry: **{industry}**" + (f"  ·  Ticker: **{quant_ticker}**" if quant_ticker != ticker else ""))
     if ticker:
-        q = get_dupont_altman_redflags_yoy(ticker)
-        if q:
-            st.markdown("#### Quantitative health (2–3 years)")
-            dupont_df = q.get("dupont")
-            if dupont_df is not None and not dupont_df.empty:
-                st.markdown("**3-Step DuPont (ROE = Net Profit Margin × Asset Turnover × Equity Multiplier)**")
-                display_cols = [c for c in ["Year", "NPM %", "Asset Turnover", "Equity Mult.", "ROE %"] if c in dupont_df.columns]
-                display_dupont = dupont_df[display_cols].copy().rename(columns={"Equity Mult.": "Equity Mult"})
-                for col in display_dupont.columns:
-                    display_dupont[col] = display_dupont[col].apply(lambda x: "N/A" if (x is None or (isinstance(x, float) and pd.isna(x))) else x)
-                st.dataframe(display_dupont, use_container_width=True, hide_index=True)
-            az = q.get("altman_z")
+        google_api_key = (st.session_state.get("google_api_key") or "").strip()
+        sec_email = (st.session_state.get("sec_email") or "").strip()
+        ai_data = {}
+        if market and "US" in market and google_api_key and sec_email:
+            with st.spinner("SEC 10-K 원본에서 재무제표 데이터를 해독하여 그래프를 생성 중입니다... (약 30~60초 소요)"):
+                sections, _ = get_10k_sections(ticker, sec_email)
+                item8 = (sections or {}).get("item8") or ""
+                if item8.strip():
+                    ai_data = get_sec_financials_llm(google_api_key, item8, ticker)
+        q = get_dupont_altman_redflags_yoy(quant_ticker)
+        dupont_df = (q or {}).get("dupont") if q else None
+        if q or ai_data:
+            st.markdown("---")
+            st.markdown("#### 📊 Financial Health (Tables & Charts)")
+            c1, c2 = st.columns(2)
+            with c1:
+                if ai_data and ai_data.get("current_yr"):
+                    sankey_data = sankey_data_from_ai(ai_data)
+                else:
+                    sankey_data = get_income_statement_sankey_data(quant_ticker)
+                if sankey_data.get("revenue", 0) > 0:
+                    fig_sankey = _build_sankey_figure(sankey_data)
+                    if fig_sankey is not None:
+                        st.plotly_chart(fig_sankey, use_container_width=True)
+                else:
+                    st.caption("Income Statement flow: data not available.")
+            with c2:
+                if ai_data and ai_data.get("current_yr"):
+                    radar_metrics = radar_metrics_from_ai(ai_data)
+                    fig_radar = _build_radar_figure_from_metrics(radar_metrics) if radar_metrics else None
+                else:
+                    fig_radar = _build_radar_figure(quant_ticker)
+                if fig_radar is not None:
+                    st.plotly_chart(fig_radar, use_container_width=True)
+                else:
+                    st.caption("Financial radar: need 2+ years of data.")
+                    with st.expander("Manual Data Entry (Radar Chart Fallback)", expanded=False):
+                        st.caption("Enter 5 key ratios to plot a custom radar. ROE %, Current Ratio, Asset Turnover, Equity Mult., Revenue YoY %.")
+                        roe_man = st.number_input("ROE %", value=15.0, min_value=-50.0, max_value=100.0, step=1.0, key="radar_roe")
+                        cr_man = st.number_input("Current Ratio", value=1.5, min_value=0.0, max_value=10.0, step=0.1, key="radar_cr")
+                        at_man = st.number_input("Asset Turnover", value=0.8, min_value=0.0, max_value=5.0, step=0.1, key="radar_at")
+                        em_man = st.number_input("Equity Mult.", value=2.0, min_value=0.5, max_value=10.0, step=0.1, key="radar_em")
+                        yoy_man = st.number_input("Revenue YoY %", value=10.0, min_value=-50.0, max_value=200.0, step=1.0, key="radar_yoy")
+                        if st.button("Plot Radar", key="radar_plot_btn"):
+                            fig_man = _build_radar_from_manual(roe_man, cr_man, at_man, em_man, yoy_man)
+                            if fig_man is not None:
+                                st.session_state["radar_manual_fig"] = fig_man
+                        if st.session_state.get("radar_manual_fig") is not None:
+                            st.plotly_chart(st.session_state["radar_manual_fig"], use_container_width=True)
+                    with st.expander("Debug: Raw YahooQuery Data", expanded=False):
+                        if YQTicker and quant_ticker:
+                            try:
+                                yq_ticker = YQTicker(quant_ticker.upper())
+                                inc_raw = yq_ticker.income_statement(trailing=False)
+                                bal_raw = yq_ticker.balance_sheet(trailing=False)
+                                if inc_raw is not None and not inc_raw.empty:
+                                    st.caption("Income statement (last 2 periods) — check column names for mapping.")
+                                    st.dataframe(inc_raw.tail(2), use_container_width=True, hide_index=True)
+                                else:
+                                    st.caption("Income statement: no data.")
+                                if bal_raw is not None and not bal_raw.empty:
+                                    st.caption("Balance sheet (last 2 periods) — check column names for mapping.")
+                                    st.dataframe(bal_raw.tail(2), use_container_width=True, hide_index=True)
+                                else:
+                                    st.caption("Balance sheet: no data.")
+                            except Exception as e:
+                                st.error(f"YahooQuery debug failed: {e}")
+                        else:
+                            st.caption("YahooQuery not available or no ticker selected.")
+            if ai_data and ai_data.get("current_yr"):
+                piot = piotroski_from_ai(ai_data)
+            else:
+                piot = get_piotroski_fscore(quant_ticker)
+            st.markdown("**Piotroski F-Score (9-point checklist)**")
+            score = piot.get("score", 0)
+            legend = "**Score 8–9: Excellent** · 4–7: Average · 0–3: High Risk"
+            st.metric("F-Score", f"{score} / 9", legend)
+            if ai_data and ai_data.get("current_yr"):
+                st.caption("*(from SEC 10-K Item 8)*")
+            elif piot.get("used_ttm"):
+                st.caption("*(Estimated via TTM Data)*")
+            st.caption("✅ = Good (passes criterion). ❌ = Fails criterion.")
+            criteria = piot.get("criteria", [])
+            if criteria:
+                cols = st.columns(3)
+                for i, (label, passed) in enumerate(criteria):
+                    with cols[i % 3]:
+                        st.caption(("✅ " if passed else "❌ ") + label)
+            az = (q or {}).get("altman_z")
             if az is not None:
-                st.metric("Altman Z-Score (distress / bankruptcy risk)", f"{az}", "Safe zone > 2.99; Grey 1.81–2.99; Distress < 1.81" if az < 1.81 else ("Grey zone" if az < 2.99 else "Safe zone"))
-            red_flags = q.get("red_flags") or []
+                st.caption(f"**Altman Z-Score:** {az} (Safe > 2.99 · Grey 1.81–2.99 · Distress < 1.81)")
+            red_flags = (q or {}).get("red_flags") or []
             if red_flags:
-                st.markdown("**Red flags**")
                 for rf in red_flags:
                     val = rf.get("value")
                     val_str = "N/A" if (val is None or (isinstance(val, float) and (pd.isna(val) or val != val))) else val
-                    st.warning(f"**{rf.get('flag', 'WARNING')}** — {rf.get('metric')}: {val_str} (threshold: {rf.get('threshold')}). {rf.get('comment', '')}")
+                    st.warning(f"**{rf.get('metric')}:** {val_str} (threshold: {rf.get('threshold')})")
             elif dupont_df is not None and not dupont_df.empty:
-                st.success("No red flags triggered (Current Ratio ≥ 1.0, Interest Coverage ≥ 1.5).")
-            sector_metrics = get_sector_specific_metrics(ticker, sector) if ticker else {}
+                st.success("No red flags (Current Ratio ≥ 1.0, Interest Coverage ≥ 1.5).")
+            sector_metrics = get_sector_specific_metrics(quant_ticker, sector) if quant_ticker else {}
             if sector_metrics:
                 st.markdown("**Sector-specific metrics**")
                 cols = st.columns(min(len(sector_metrics), 4))
@@ -1179,68 +2421,196 @@ with tab1:
                     with cols[i % len(cols)]:
                         disp = f"{v}" if v is not None else "N/A"
                         st.metric(k, disp, None)
-            yoy_list = q.get("yoy") or []
+            def _style_change_column(df: pd.DataFrame):
+                """Green for improvement (+), red for decline (-) in Change column."""
+                change_col = "Change (%)" if "Change (%)" in df.columns else "Change"
+                if change_col not in df.columns or df.empty:
+                    return df.style
+                def _cell_style(v):
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        return ""
+                    s = str(v).strip()
+                    if s == "—":
+                        return ""
+                    if s.startswith("+") or "↑" in s:
+                        return "background-color: #d4edda; color: #155724"
+                    if s.startswith("-") or "↓" in s:
+                        return "background-color: #f8d7da; color: #721c24"
+                    return ""
+                return df.style.apply(lambda col: [_cell_style(v) for v in col], subset=[change_col])
+            yoy_list = (q or {}).get("yoy") or []
             if yoy_list:
                 st.markdown("**YoY ratio changes**")
+                rows_yoy = []
                 for item in yoy_list:
-                    st.caption(f"**{item.get('Ratio')}**: {item.get('Comment', '')}")
+                    cur = item.get("Latest")
+                    chg_pp = item.get("YoY (pp)")
+                    chg_pct = item.get("YoY %")
+                    if chg_pp is not None:
+                        chg_str = f"{chg_pp:+.1f}%"
+                    elif chg_pct is not None:
+                        chg_str = f"{chg_pct:+.1f}%"
+                    else:
+                        chg_str = "—"
+                    status = "↑" if (chg_pp is not None and chg_pp > 0) or (chg_pct is not None and chg_pct > 0) else ("↓" if (chg_pp is not None and chg_pp < 0) or (chg_pct is not None and chg_pct < 0) else "—")
+                    rows_yoy.append({"Metric": item.get("Ratio"), "Current Value": cur, "Change (%)": chg_str, "Status": status})
+                if rows_yoy:
+                    df_yoy = pd.DataFrame(rows_yoy)
+                    st.dataframe(_style_change_column(df_yoy), use_container_width=True, hide_index=True)
+            st.markdown("**Quarter ratio changes**")
+            qmom = get_quarterly_momentum(quant_ticker)
+            qoq_rows = get_quarterly_ratio_changes(quant_ticker)
+            qoq_r, qoq_n = qmom.get("qoq_revenue_pct"), qmom.get("qoq_ni_pct")
+            build = []
+            if qoq_r is not None:
+                build.append({"Metric": "Revenue", "Current Value": "—", "Change (%)": f"{qoq_r:+.1f}%", "Status": "↑" if qoq_r > 0 else "↓"})
+            if qoq_n is not None:
+                build.append({"Metric": "Net Income", "Current Value": "—", "Change (%)": f"{qoq_n:+.1f}%", "Status": "↑" if qoq_n > 0 else "↓"})
+            for r in qoq_rows:
+                r_copy = dict(r)
+                if "Change" in r_copy and "Change (%)" not in r_copy:
+                    r_copy["Change (%)"] = r_copy.pop("Change", "—")
+                if "Trend" in r_copy:
+                    r_copy["Status"] = r_copy.pop("Trend", "—")
+                build.append(r_copy)
+            if build:
+                df_q = pd.DataFrame(build)
+                if "Change" in df_q.columns and "Change (%)" not in df_q.columns:
+                    df_q = df_q.rename(columns={"Change": "Change (%)"})
+                if "Trend" in df_q.columns:
+                    df_q = df_q.rename(columns={"Trend": "Status"})
+                st.dataframe(_style_change_column(df_q), use_container_width=True, hide_index=True)
+            elif not qmom.get("df") or qmom["df"].empty:
+                st.caption("Quarterly data not available for this ticker.")
         else:
             st.info("Quantitative data not available for this ticker.")
     st.markdown("---")
-    st.markdown("#### Qualitative: MD&A comparative analysis")
-    st.markdown("Download **latest 10-K** and **10-K from 3 years ago**. Extract **Item 7 (MD&A)** from both. Gemini: strategy shifts, emerging risks, management tone.")
-    if st.button("Run 10-K Comparative Analysis", key="run_10k"):
-        if not ticker:
-            st.error("Enter a ticker in the sidebar.")
-        elif not st.session_state.get("google_api_key"):
-            st.error("Enter your Google API Key in the sidebar.")
-        elif not st.session_state.get("sec_email"):
-            st.error("Enter your SEC EDGAR email in the sidebar.")
-        else:
-            try:
-                with st.spinner("Downloading 10-Ks (latest + 3 years ago) and extracting Item 7..."):
-                    item1a, item7_latest, item7_3y_ago, has_comparison = download_item7_latest_and_3y_ago(
-                        ticker, st.session_state["sec_email"]
-                    )
-                if not has_comparison:
-                    st.info("Only one or fewer 10-K filings available; showing single-year analysis.")
-                with st.spinner("Running Gemini (comparative or single-year analysis)..."):
-                    si = get_sector_industry(ticker)
-                    analysis = get_mda_comparative_insights(
-                        st.session_state["google_api_key"],
-                        item1a,
-                        item7_latest,
-                        item7_3y_ago,
-                        ticker,
-                        sector=si.get("sector"),
-                        industry=si.get("industry"),
-                    )
-                st.success("Analysis complete.")
-                st.markdown(analysis)
-                with st.expander("View raw excerpt (Item 1A + Item 7 latest)"):
-                    excerpt = (item1a or "") + "\n\n---\n\n" + (item7_latest or "")
-                    st.text(excerpt[:12000] + ("..." if len(excerpt) > 12000 else ""))
-            except FileNotFoundError as e:
-                st.error(str(e))
-            except ValueError as e:
-                st.error(str(e))
-            except RuntimeError as e:
-                st.error(str(e))
-            except Exception as e:
-                st.error("An error occurred. See details below.")
-                with st.expander("Error details"):
-                    st.code(repr(e), language="text")
+    st.markdown("#### 🔍 Deep-Dive Analysis (AI)")
+    st.caption("10-K sections are cached in **data/**; repeat runs use cache for instant AI analysis. First run may take 20–60 s to fetch 10-K; Gemini then streams in ~5–10 s.")
+    if not ticker:
+        st.caption("Enter a ticker in the sidebar to enable analysis.")
+    else:
+        api_ok = bool(st.session_state.get("google_api_key"))
+        email_ok = bool(st.session_state.get("sec_email"))
+        err_msg = []
+        if not api_ok:
+            err_msg.append("Google API Key")
+        if not email_ok:
+            err_msg.append("SEC EDGAR Email")
+        if err_msg:
+            st.caption(f"Set **{' and '.join(err_msg)}** in the sidebar to run analysis.")
+        col_a, col_b = st.columns(2)
+        is_us = market and "US" in market
+        is_korea = market and ("Korea" in market or "KOSPI" in market or "KOSDAQ" in market)
+        is_japan_uk = market and ("Japan" in market or "Nikkei" in market or "UK" in market or "LSE" in market)
+        # --- Button A: Management Strategy ---
+        with col_a:
+            if st.button("Analyze Management Strategy (MD&A)", key="run_mda_strategy"):
+                if is_korea:
+                    st.warning("DART API integration for Korean MD&A is currently under construction. Please check back in Phase 2.")
+                elif is_japan_uk:
+                    st.warning("EDINET/LSE document parsing is currently under development.")
+                elif not api_ok or not email_ok:
+                    st.error("Set API Key and SEC Email in the sidebar.")
+                else:
+                    try:
+                        with st.status("Loading 10-K (cache or download)...", expanded=True) as status:
+                            sections, _ = get_10k_sections(ticker, st.session_state["sec_email"])
+                            si = get_sector_industry(quant_ticker)
+                            status.update(label="10-K loaded. Calling Gemini…", state="running")
+
+                        # Stream OUTSIDE the status box so user sees text as it arrives
+                        st.markdown("### Management Strategy (Item 7)")
+                        st.caption("Streaming from Gemini (first words in ~5–10 sec, then flows in real time).")
+                        stream_gen = get_gemini_item7_strategy_stream(
+                            st.session_state["google_api_key"],
+                            sections.get("item7") or "",
+                            ticker,
+                            si.get("sector") or "N/A",
+                            si.get("industry") or "N/A",
+                        )
+                        # write_stream returns the full concatenated string after it finishes streaming
+                        full_response = st.write_stream(stream_gen)
+
+                        st.session_state["mda_strategy_result"] = full_response
+                        st.session_state["mda_strategy_ticker"] = ticker
+                        st.session_state["mda_strategy_error"] = None
+                    except Exception as e:
+                        st.session_state["mda_strategy_error"] = str(e)
+                        st.error(f"Strategy analysis failed: {str(e)}")
+        # --- Button B: Risk Factors & Forensic ---
+        with col_b:
+            if st.button("Analyze Risk Factors (Item 1A)", key="run_mda_risk"):
+                if is_korea:
+                    st.warning("DART API integration for Korean MD&A is currently under construction. Please check back in Phase 2.")
+                elif is_japan_uk:
+                    st.warning("EDINET/LSE document parsing is currently under development.")
+                elif not api_ok or not email_ok:
+                    st.error("Set API Key and SEC Email in the sidebar.")
+                else:
+                    try:
+                        with st.status("Loading 10-K (cache or download)...", expanded=True) as status:
+                            sections, _ = get_10k_sections(ticker, st.session_state["sec_email"])
+                            status.update(label="10-K loaded. Running forensic audit…", state="running")
+
+                            # Run forensic silently IN THE BACKGROUND first
+                            forensic = _gemini_forensic_audit(
+                                st.session_state["google_api_key"],
+                                sections.get("item3") or "",
+                                sections.get("item9a") or "",
+                                ticker,
+                            )
+                            status.update(label="Done.", state="complete")
+                        # Stream the risk factors OUTSIDE the status box
+                        st.markdown("### Risk Factors (Item 1A)")
+                        st.caption("Streaming from Gemini (first words in ~5–10 sec, then flows in real time).")
+                        stream_gen = get_gemini_item1a_risks_stream(
+                            st.session_state["google_api_key"],
+                            sections.get("item1a") or "",
+                            ticker,
+                        )
+                        risk_response = st.write_stream(stream_gen)
+
+                        # Combine both for the final result
+                        final_out = risk_response
+                        if forensic and forensic.strip():
+                            st.markdown("### Forensic Audit (Item 3 & 9A)")
+                            st.markdown(forensic.strip())
+                            final_out += f"\n\n---\n\n### Forensic Audit (Item 3 & 9A)\n\n{forensic.strip()}"
+
+                        st.session_state["mda_risk_result"] = final_out
+                        st.session_state["mda_risk_ticker"] = ticker
+                        st.session_state["mda_risk_error"] = None
+                    except Exception as e:
+                        st.session_state["mda_risk_error"] = str(e)
+                        st.error(f"Risk analysis failed: {str(e)}")
+        # --- Display Saved Results if User Switches Tabs ---
+        st.markdown("---")
+        if st.session_state.get("mda_strategy_ticker") == ticker:
+            if st.session_state.get("mda_strategy_error"):
+                st.error("Strategy Error: " + st.session_state["mda_strategy_error"])
+            elif st.session_state.get("mda_strategy_result"):
+                with st.expander("View Previous Strategy Analysis", expanded=True):
+                    st.markdown(st.session_state["mda_strategy_result"])
+        if st.session_state.get("mda_risk_ticker") == ticker:
+            if st.session_state.get("mda_risk_error"):
+                st.error("Risk Error: " + st.session_state["mda_risk_error"])
+            elif st.session_state.get("mda_risk_result"):
+                with st.expander("View Previous Risk & Forensic Analysis", expanded=True):
+                    st.markdown(st.session_state["mda_risk_result"])
 
 # ----- Tab 2: 5-Year Trend + 3-Scenario DCF -----
 with tab2:
+    market_t2 = st.session_state.get("market") or MARKET_OPTIONS[0]
+    quant_ticker_t2 = get_global_ticker(ticker, market_t2) if ticker else ""
     st.subheader("5-Year Financial Trend & DCF Valuation")
     if ticker:
-        si_t2 = get_sector_industry(ticker)
+        si_t2 = get_sector_industry(quant_ticker_t2)
         sector_t2 = (si_t2.get("sector") or "").lower()
         is_financial = "financial" in sector_t2 or "bank" in sector_t2 or "insurance" in sector_t2
     else:
         is_financial = False
-    df_trend = get_5yr_financial_trend(ticker) if ticker else pd.DataFrame()
+    df_trend = get_5yr_financial_trend(quant_ticker_t2) if quant_ticker_t2 else pd.DataFrame()
     if not df_trend.empty and len(df_trend) >= 1:
         st.markdown("#### Key metrics (YoY % change)")
         latest = df_trend.iloc[0]
@@ -1278,7 +2648,7 @@ with tab2:
         st.caption("5-year trend not available for this ticker. DCF section below uses latest FCF from yfinance.")
     st.markdown("---")
     st.markdown("#### DCF valuation (Excel-style): inputs & 3-scenario output")
-    dcf_inputs = get_dcf_inputs(ticker) if ticker else {"fcf": None, "total_debt": 0.0, "cash": 0.0, "shares": None}
+    dcf_inputs = get_dcf_inputs(quant_ticker_t2) if quant_ticker_t2 else {"fcf": None, "total_debt": 0.0, "cash": 0.0, "shares": None}
     fcf_fetched = dcf_inputs.get("fcf")
     total_debt = float(dcf_inputs.get("total_debt") or 0.0)
     cash = float(dcf_inputs.get("cash") or 0.0)
@@ -1305,7 +2675,7 @@ with tab2:
     else:
         st.caption(f"Total Debt: **${total_debt/1e9:.2f}B**" if total_debt >= 1e9 else f"Total Debt: **${total_debt/1e6:.0f}M**" if total_debt >= 1e6 else f"Total Debt: **${total_debt:,.0f}**")
         st.caption(f"Cash & Equivalents: **${cash/1e9:.2f}B**" if cash >= 1e9 else f"Cash & Equivalents: **${cash/1e6:.0f}M**" if cash >= 1e6 else f"Cash & Equivalents: **${cash:,.0f}**")
-    dcf_defaults = get_dcf_smart_defaults(ticker) if ticker else {"wacc_pct": 10.0, "term_growth_pct": 2.5, "fcf_growth_pct": 8.0}
+    dcf_defaults = get_dcf_smart_defaults(quant_ticker_t2) if quant_ticker_t2 else {"wacc_pct": 10.0, "term_growth_pct": 2.5, "fcf_growth_pct": 8.0}
     st.markdown("**Assumptions (sliders)**")
     st.caption("💡 Slider defaults are auto-generated based on the company's Beta (CAPM) and revenue growth estimates.")
     col1, col2, col3 = st.columns(3)
@@ -1321,7 +2691,7 @@ with tab2:
         left_col, right_col = st.columns(2)
         with left_col:
             st.markdown("**Analyst consensus (yfinance)**")
-            analyst = get_analyst_consensus(ticker) if ticker else {}
+            analyst = get_analyst_consensus(quant_ticker_t2) if quant_ticker_t2 else {}
             st.markdown(f"- **Target mean price:** {analyst.get('targetMeanPrice', 'N/A')}")
             st.markdown(f"- **Recommendation:** {analyst.get('recommendationKey', 'N/A')}")
             st.markdown(f"- **Revenue growth est.:** {analyst.get('revenueGrowth', 'N/A')}")
@@ -1341,9 +2711,9 @@ with tab2:
     price_bull = res_bull.get("value_per_share") or 0.0
     price_bear = res_bear.get("value_per_share") or 0.0
     current_price = None
-    if ticker and yf:
+    if quant_ticker_t2 and yf:
         try:
-            info = yf.Ticker(ticker.upper()).info or {}
+            info = yf.Ticker(quant_ticker_t2.upper()).info or {}
             current_price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
         except Exception:
             pass

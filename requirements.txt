@@ -7,4 +7,5 @@ pandas>=2.0.0
 lxml>=4.9.0
 python-dotenv>=1.0.0
 yfinance>=0.2.40
+yahooquery>=2.2.0
 plotly>=5.18.0
