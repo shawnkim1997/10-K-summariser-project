@@ -1,0 +1,30 @@
+graph TD
+    User([User]) -->|Inputs: API Key, Email, Ticker| UI[Streamlit UI]
+    
+    subgraph Frontend/Backend Application
+        UI --> Tab1[10-K & MD&A Insights]
+        UI --> Tab2[DCF Valuation]
+        UI --> Tab3[Sector Analysis]
+        
+        Tab1 --> QualParser[Regex & BeautifulSoup Parser]
+        Tab2 --> QuantProcessor[Pandas Financial Processor]
+        Tab3 --> PeerProcessor[Comps Processor]
+    end
+
+    subgraph External APIs
+        SEC[(SEC EDGAR Database)]
+        YF[(yfinance / yahooquery)]
+        LLM[Google Gemini 2.0 Flash]
+    end
+
+    QualParser -->|Fetch 10-K HTML| SEC
+    QualParser -->|Cleaned Text (Item 1A, 7)| LLM
+    LLM -->|Qualitative Insights| Tab1
+    LLM -->|Industry Outlook| Tab3
+
+    QuantProcessor -->|Fetch Financials| YF
+    PeerProcessor -->|Fetch Multiples| YF
+    YF -->|Raw Data| QuantProcessor
+    
+    QuantProcessor -->|DCF, Ratios| Tab2
+    QuantProcessor -->|DuPont, Sankey| Tab1

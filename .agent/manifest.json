@@ -1,0 +1,19 @@
+{
+  "project_name": "10-K Financial Analyzer Dashboard",
+  "version": "1.0.0",
+  "description": "A hybrid architecture application unifying qualitative LLM-driven insights and quantitative financial valuation.",
+  "author": "shawnkim1997",
+  "entrypoint": "app.py",
+  "components": [
+    "10-K Text Extraction & LLM Summarizer",
+    "10-Year 2-Stage DCF Valuation Model",
+    "Top-down Industry Comparables Analyzer"
+  ],
+  "technologies": [
+    "Python",
+    "Streamlit",
+    "Gemini 2.0 Flash",
+    "yfinance",
+    "BeautifulSoup"
+  ]
+}

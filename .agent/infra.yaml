@@ -1,0 +1,28 @@
+infrastructure:
+  environment:
+    language: "Python 3.9+"
+    framework: "Streamlit >= 1.28.0"
+  
+  external_apis:
+    - name: "Google Gemini API"
+      library: "google-generativeai >= 0.8.0"
+      usage: "MD&A 인사이트 도출, 리스크 분석, 산업 전망 리포트 생성"
+      auth: "API Key (GOOGLE_API_KEY)"
+      
+    - name: "SEC EDGAR API"
+      library: "sec-edgar-downloader >= 5.0.0"
+      usage: "최신 10-K 공시 원문(HTML) 다운로드"
+      auth: "User-Agent Email (SEC_EDGAR_EMAIL)"
+      
+    - name: "Yahoo Finance API"
+      library: ["yfinance >= 0.2.40", "yahooquery >= 2.2.0"]
+      usage: "티커 검색, 재무제표, 현금흐름, 주식수, 경쟁사 멀티플 추출"
+      auth: "None Required"
+
+  data_processing:
+    - name: "Pandas"
+      version: ">= 2.0.0"
+    - name: "BeautifulSoup4 / lxml"
+      version: ">= 4.12.0 / 4.9.0"
+    - name: "Plotly"
+      version: ">= 5.18.0"

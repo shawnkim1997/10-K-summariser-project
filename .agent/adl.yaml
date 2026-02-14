@@ -1,0 +1,18 @@
+architecture_decisions:
+  - id: ADL-001
+    title: "하이브리드 처리 및 선택적 섹션 추출 (429 에러 해결)"
+    context: "10-K 원본 전체를 LLM에 전송할 경우 Token 한도 초과 및 Rate Limit(429) 발생."
+    decision: "정규식으로 Item 7(MD&A), Item 1A 등 핵심 텍스트만 추출(Targeted Parsing). 정량 데이터(Item 8)는 yfinance로 대체 처리하여 토큰 사용량을 80% 이상 절감."
+    status: "Implemented"
+
+  - id: ADL-002
+    title: "10년 2단계(2-Stage) DCF 모델 채택"
+    context: "고성장 기업의 경우 일반적인 5년 DCF 모델은 영구 가치(Terminal Value)를 과대평가하는 왜곡 발생."
+    decision: "1~5년차는 예상 성장률 적용, 6~10년차는 영구 성장률(2.5%)까지 선형 하락(Fade)시키는 기관급 10년 모델 적용."
+    status: "Implemented"
+
+  - id: ADL-003
+    title: "금융 데이터 다중 폴백(Fallback) 시스템"
+    context: "S&P 500 이외의 주식은 yfinance 등에서 특정 재무 데이터가 누락되는 문제 발생."
+    decision: "yahooquery를 1순위로 사용하되, 실패 시 yfinance의 여러 속성(fast_info -> info -> balance_sheet)을 순차적으로 탐색(Fallback). 연간 데이터 누락 시 분기별 데이터(TTM) 합산 처리."
+    status: "Implemented"
