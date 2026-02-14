@@ -2276,7 +2276,7 @@ with st.sidebar:
 
     search_options = st.session_state.get("company_search_options") or []
     search_symbols = st.session_state.get("company_search_symbols") or []
-    placeholder = "— 검색 버튼을 눌러 주세요 / Click Search above —"
+    placeholder = "— Click the search button above —"
     options_for_select = [placeholder] if not search_options else search_options
     current_ticker = st.session_state.get("ticker", "NVDA")
     default_idx = 0
